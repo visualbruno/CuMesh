@@ -46,44 +46,87 @@ static __global__ void init_normal_cones_kernel(
 
 
 static __global__ void init_chart_adj_kernel(
+    const float3* vertices,
+    const int3* faces,
     const int2* face_adj,
     const int* chart_ids,
     const size_t M,
-    uint64_t* chart_adj
+    uint64_t* chart_adj,
+    float* length
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= M) return;
 
     int f0 = face_adj[tid].x;
     int f1 = face_adj[tid].y;
+    
     int c0 = chart_ids[f0];
     int c1 = chart_ids[f1];
+
     if (c0 == c1) {
-        chart_adj[tid] = UINT64_MAX; // mark as invalid edge
+        chart_adj[tid] = UINT64_MAX;
+        length[tid] = 0.0f;
         return;
     }
+
     int min_c = min(c0, c1);
     int max_c = max(c0, c1);
     chart_adj[tid] = (static_cast<uint64_t>(min_c) << 32) | static_cast<uint64_t>(max_c);
+
+    int3 tri0 = faces[f0];
+    int3 tri1 = faces[f1];
+
+    int t0_indices[3] = {tri0.x, tri0.y, tri0.z};
+    int common_v_indices[2]; 
+    int found_count = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        int v = t0_indices[i];
+        if (v == tri1.x || v == tri1.y || v == tri1.z) {
+            if (found_count < 2) {
+                common_v_indices[found_count] = v;
+            }
+            found_count++;
+        }
+    }
+
+    if (found_count >= 2) {
+        float3 p0 = vertices[common_v_indices[0]];
+        float3 p1 = vertices[common_v_indices[1]];
+
+        float dx = p0.x - p1.x;
+        float dy = p0.y - p1.y;
+        float dz = p0.z - p1.z;
+
+        length[tid] = sqrtf(dx * dx + dy * dy + dz * dz);
+    } else {
+        length[tid] = 0.0f;
+    }
 }
 
 
 static __global__ void get_chart_edge_cnt_kernel(
     const uint64_t* chart_adj,
+    const float* chart_adj_length,
     const int E,
-    int* chart2edge_cnt
+    int* chart2edge_cnt,
+    float* chart_perim
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
 
     // get edge
     uint64_t c = chart_adj[tid];
+    float l = chart_adj_length[tid];
     int c0 = int(c >> 32);
     int c1 = int(c & 0xFFFFFFFF);
 
     // count vertex adjacent edge number
     atomicAdd(&chart2edge_cnt[c0], 1);
     atomicAdd(&chart2edge_cnt[c1], 1);
+    atomicAdd(&chart_perim[c0], l);
+    atomicAdd(&chart_perim[c1], l);
 }
 
 
@@ -111,6 +154,11 @@ static __global__ void get_chart_edge_adjacency_kernel(
 static __global__ void compute_chart_adjacency_cost_kernel(
     const uint64_t* chart_adj,
     const float4* chart_normal_cones,
+    const float* chart_adj_length,
+    const float* chart_perims,
+    const float* chart_areas,
+    float area_penalty_weight,
+    float perimeter_area_ratio_weight,
     const int E,
     float* chart_adj_costs
 ) {
@@ -132,7 +180,17 @@ static __global__ void compute_chart_adjacency_cost_kernel(
     float new_cone_low = fminf(-half_angle0, axis_angle - half_angle1);
     float new_cone_high = fmaxf(half_angle0, axis_angle + half_angle1);
     float new_half_angle = (new_cone_high - new_cone_low) * 0.5f;
-    chart_adj_costs[tid] = new_half_angle;
+    float cost = new_half_angle;
+
+    // Chart area panelty
+    float new_area = (chart_areas[c0] + chart_areas[c1]);
+    cost += area_penalty_weight * new_area;
+
+    // Perim-area ration panelty
+    float new_perim = chart_perims[c0] + chart_perims[c1] - 2 * chart_adj_length[tid];
+    cost += perimeter_area_ratio_weight * (new_perim * new_perim / new_area);
+
+    chart_adj_costs[tid] = cost;
 }
 
 
@@ -224,70 +282,104 @@ static void get_chart_connectivity(
     size_t M = mesh.manifold_face_adj.size;
 
     // 1. Get chart adjacency
-    // 1.1 Initialize chart adjacency
+    // 1.1 Initialize chart adjacency and edge lengths
     mesh.atlas_chart_adj.resize(M);
+    mesh.atlas_chart_adj_length.resize(M);
+    float *cu_raw_lengths, *cu_sorted_lengths;
+    CUDA_CHECK(cudaMalloc(&cu_raw_lengths, M * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&cu_sorted_lengths, M * sizeof(float)));
+
     init_chart_adj_kernel<<<(M + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        mesh.vertices.ptr,
+        mesh.faces.ptr,
         mesh.manifold_face_adj.ptr,
         mesh.atlas_chart_ids.ptr,
         M,
-        mesh.atlas_chart_adj.ptr
+        mesh.atlas_chart_adj.ptr,
+        cu_raw_lengths
     );
     CUDA_CHECK(cudaGetLastError());
 
     // 1.2 Sort
     size_t temp_storage_bytes = 0;
     mesh.temp_storage.resize(M * sizeof(uint64_t));
-    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, temp_storage_bytes,
         mesh.atlas_chart_adj.ptr,
         reinterpret_cast<uint64_t*>(mesh.temp_storage.ptr),
+        cu_raw_lengths,
+        cu_sorted_lengths,
         M
     ));
     mesh.cub_temp_storage.resize(temp_storage_bytes);
-    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         mesh.cub_temp_storage.ptr, temp_storage_bytes,
         mesh.atlas_chart_adj.ptr,
         reinterpret_cast<uint64_t*>(mesh.temp_storage.ptr),
+        cu_raw_lengths,
+        cu_sorted_lengths,
         M
     ));
+    CUDA_CHECK(cudaFree(cu_raw_lengths));
 
-    // 1.3 Unique
+    // 1.3 Reduce By Key (Aggregate duplicate chart pairs by summing lengths)
     int* cu_num_chart_adjs;
     CUDA_CHECK(cudaMalloc(&cu_num_chart_adjs, sizeof(int)));
     temp_storage_bytes = 0;
-    CUDA_CHECK(cub::DeviceSelect::Unique(
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
         nullptr, temp_storage_bytes,
         reinterpret_cast<uint64_t*>(mesh.temp_storage.ptr),
         mesh.atlas_chart_adj.ptr,
+        cu_sorted_lengths,
+        mesh.atlas_chart_adj_length.ptr,
         cu_num_chart_adjs,
+        cub::Sum(),
         M
     ));
     mesh.cub_temp_storage.resize(temp_storage_bytes);
-    CUDA_CHECK(cub::DeviceSelect::Unique(
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
         mesh.cub_temp_storage.ptr, temp_storage_bytes,
         reinterpret_cast<uint64_t*>(mesh.temp_storage.ptr),
         mesh.atlas_chart_adj.ptr,
+        cu_sorted_lengths,
+        mesh.atlas_chart_adj_length.ptr,
         cu_num_chart_adjs,
+        cub::Sum(),
         M
     ));
     CUDA_CHECK(cudaMemcpy(&mesh.atlas_chart_adj.size, cu_num_chart_adjs, sizeof(int), cudaMemcpyDeviceToHost));
+    mesh.atlas_chart_adj_length.size = mesh.atlas_chart_adj.size;
+    CUDA_CHECK(cudaFree(cu_sorted_lengths));
     CUDA_CHECK(cudaFree(cu_num_chart_adjs));
+    // Remove invalid edge (UINT64_MAX) if present
+    // Since we sorted, invalid edges are at the end.
     uint64_t last_key;
-    CUDA_CHECK(cudaMemcpy(&last_key, mesh.atlas_chart_adj.ptr + mesh.atlas_chart_adj.size - 1, sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    if (last_key == UINT64_MAX) { // If contains invalid edge, it will at the last position after sorting, subtract 1 to get the actual size
-        mesh.atlas_chart_adj.size -= 1;
+    if (mesh.atlas_chart_adj.size > 0) {
+        CUDA_CHECK(cudaMemcpy(&last_key, mesh.atlas_chart_adj.ptr + mesh.atlas_chart_adj.size - 1, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        if (last_key == UINT64_MAX) { 
+            mesh.atlas_chart_adj.size -= 1;
+            mesh.atlas_chart_adj_length.size -= 1;
+        }
+    }
+    // Early stop if no valid edges
+    if (mesh.atlas_chart_adj.size == 0) {
+        return;
     }
 
     // 2. Get chart-edge connectivity
     size_t E = mesh.atlas_chart_adj.size;
     size_t C = mesh.atlas_num_charts;
-    // 2.1 Count edge number for each chart
+    // 2.1 Count edge number for each chart, along with perim
     mesh.atlas_chart2edge_cnt.resize(C);
     mesh.atlas_chart2edge_cnt.zero();
+    mesh.atlas_chart_perims.resize(C);
+    mesh.atlas_chart_perims.zero();
     get_chart_edge_cnt_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         mesh.atlas_chart_adj.ptr,
+        mesh.atlas_chart_adj_length.ptr,
         E,
-        mesh.atlas_chart2edge_cnt.ptr
+        mesh.atlas_chart2edge_cnt.ptr,
+        mesh.atlas_chart_perims.ptr
     );
     CUDA_CHECK(cudaGetLastError());
     // 2.2 Prepare CSR format for chart-edge connectivity
@@ -382,7 +474,6 @@ static __global__ void update_normal_cones_kernel(
 
 void compute_chart_normal_cones(
     CuMesh& mesh
-    
 ) {
     size_t C = mesh.atlas_num_charts;
     size_t F = mesh.faces.size;
@@ -452,7 +543,31 @@ void compute_chart_normal_cones(
     ));
     CUDA_CHECK(cudaFree(cu_chart_size));
 
-    // 3. Compute chart normals
+    // 3. Compute chart normals and areas
+    float* cu_sorted_face_areas;
+    CUDA_CHECK(cudaMalloc(&cu_sorted_face_areas, F * sizeof(float)));
+    index_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        mesh.face_areas.ptr,
+        argsorted_faces_ids,
+        F,
+        cu_sorted_face_areas
+    );
+    CUDA_CHECK(cudaGetLastError());
+    mesh.atlas_chart_areas.resize(C);
+    CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
+        nullptr, temp_storage_bytes,
+        cu_sorted_face_areas, mesh.atlas_chart_areas.ptr,
+        C,
+        cu_chart_offsets, cu_chart_offsets + 1
+    ));
+    mesh.cub_temp_storage.resize(temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
+        mesh.cub_temp_storage.ptr, temp_storage_bytes,
+        cu_sorted_face_areas, mesh.atlas_chart_areas.ptr,
+        C,
+        cu_chart_offsets, cu_chart_offsets + 1
+    ));
+
     float3* cu_sorted_face_normals;
     CUDA_CHECK(cudaMalloc(&cu_sorted_face_normals, F * sizeof(float3)));
     index_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
@@ -783,11 +898,26 @@ static __global__ void unpack_faces_kernel(
 static __global__ void unpack_vertex_ids_kernel(
     const uint64_t* pack,
     const size_t N,
-    int* vertex_ids
+    int* vertex_ids,
+    int* vertex_offsets
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= N) return;
     vertex_ids[tid] = int(pack[tid] & 0xFFFFFFFF);
+
+    int cur_c = int(pack[tid] >> 32);
+    if (tid == 0) {
+        vertex_offsets[0] = 0;
+    }
+    else {
+        int prev_c = int(pack[tid - 1] >> 32);
+        if (cur_c != prev_c) {
+            vertex_offsets[cur_c] = tid;
+        }
+    }
+    if (tid == N - 1) {
+        vertex_offsets[cur_c + 1] = N;
+    }
 }
 
 
@@ -883,10 +1013,12 @@ void construct_chart_mesh(
         cu_inverse_pack
     );
     mesh.atlas_chart_vertex_map.resize(new_num_vertices);
+    mesh.atlas_chart_vertex_offset.resize(mesh.atlas_num_charts + 1);
     unpack_vertex_ids_kernel<<<(new_num_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         cu_inverse_pack,
         new_num_vertices,
-        mesh.atlas_chart_vertex_map.ptr
+        mesh.atlas_chart_vertex_map.ptr,
+        mesh.atlas_chart_vertex_offset.ptr
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_inverse_pack));
@@ -901,16 +1033,21 @@ void construct_chart_mesh(
 
 
 void CuMesh::compute_charts(
-    float threshold_cone_half_angle_rad,
-    int refine_iterations,
-    int global_iterations,
-    float smooth_strength
+    float threshold_cone_half_angle_rad, 
+    int refine_iterations, 
+    int global_iterations, 
+    float smooth_strength,
+    float area_penalty_weight,
+    float perimeter_area_ratio_weight
 ) {
     if (this->manifold_face_adj.is_empty()) {
         this->get_manifold_face_adjacency();
     }
     if (this->face_normals.is_empty()) {
         this->compute_face_normals();
+    }
+    if (this->face_areas.is_empty()) {
+        this->compute_face_areas();
     }
 
     // Initialize chart id
@@ -933,6 +1070,7 @@ void CuMesh::compute_charts(
 
             // 1. Compute chart connectivity
             get_chart_connectivity(*this);
+            if (this->atlas_chart_adj.size == 0) break;
 
             // 2. Compute normal cones
             compute_chart_normal_cones(*this);
@@ -943,6 +1081,11 @@ void CuMesh::compute_charts(
             compute_chart_adjacency_cost_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
                 this->atlas_chart_adj.ptr,
                 this->atlas_chart_normal_cones.ptr,
+                this->atlas_chart_adj_length.ptr,
+                this->atlas_chart_perims.ptr,
+                this->atlas_chart_areas.ptr,
+                area_penalty_weight,
+                perimeter_area_ratio_weight,
                 E,
                 this->edge_collapse_costs.ptr
             );
@@ -1027,7 +1170,7 @@ void CuMesh::compute_charts(
 }
 
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CuMesh::read_atlas_charts() {
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CuMesh::read_atlas_charts() {
     auto chart_ids = torch::empty({ static_cast<int64_t>(this->faces.size) }, torch::dtype(torch::kInt32).device(torch::kCUDA));
     CUDA_CHECK(cudaMemcpy(
         chart_ids.data_ptr<int>(),
@@ -1049,6 +1192,13 @@ std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CuMe
         this->atlas_chart_faces.size * 3 * sizeof(int),
         cudaMemcpyDeviceToDevice
     ));
+    auto chart_vertex_offset = torch::empty({ static_cast<int64_t>(this->atlas_chart_vertex_offset.size) }, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    CUDA_CHECK(cudaMemcpy(
+        chart_vertex_offset.data_ptr<int>(),
+        this->atlas_chart_vertex_offset.ptr,
+        this->atlas_chart_vertex_offset.size * sizeof(int),
+        cudaMemcpyDeviceToDevice
+    ));
     auto chart_face_offset = torch::empty({ static_cast<int64_t>(this->atlas_chart_faces_offset.size) }, torch::dtype(torch::kInt32).device(torch::kCUDA));
     CUDA_CHECK(cudaMemcpy(
         chart_face_offset.data_ptr<int>(),
@@ -1056,7 +1206,7 @@ std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> CuMe
         this->atlas_chart_faces_offset.size * sizeof(int),
         cudaMemcpyDeviceToDevice
     ));
-    return std::make_tuple(this->atlas_num_charts, chart_ids, vertex_map, chart_faces, chart_face_offset);
+    return std::make_tuple(this->atlas_num_charts, chart_ids, vertex_map, chart_faces, chart_vertex_offset, chart_face_offset);
 }
 
 

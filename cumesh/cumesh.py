@@ -337,7 +337,9 @@ class CuMesh:
         threshold_cone_half_angle_rad: float=math.radians(90),
         refine_iterations: int=100,
         global_iterations: int=3,
-        smooth_strength: float=1
+        smooth_strength: float=1,
+        area_penalty_weight: float=0.1,
+        perimeter_area_ratio_weight: float=0.0001,
     ):
         """
         Compute the atlas charts.
@@ -346,10 +348,23 @@ class CuMesh:
             threshold_cone_half_angle_rad: The threshold for the cone half angle in radians.
             refine_iterations: The number of refinement iterations.
             smooth_strength: The strength of chart boundary smoothing.
+            area_penalty_weight: Coefficient for chart size penalty. Cost += Area * weight.
+                                 Prevents charts from becoming too large if > 0, 
+                                 or encourages larger charts if < 0 (though usually used to penalize size variance).
+            perimeter_area_ratio_weight: Coefficient for shape irregularity (long-strip) penalty. 
+                                         Cost += (Perimeter / Area) * weight.
+                                         Higher values penalize long strips and encourage circular/compact shapes.
         """
-        self.cu_mesh.compute_charts(threshold_cone_half_angle_rad, refine_iterations, global_iterations, smooth_strength)
+        self.cu_mesh.compute_charts(
+            threshold_cone_half_angle_rad,
+            refine_iterations,
+            global_iterations,
+            smooth_strength,
+            area_penalty_weight,
+            perimeter_area_ratio_weight
+        )
         
-    def read_atlas_charts(self) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def read_atlas_charts(self) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Read the atlas chart IDs for each face.
         
@@ -357,8 +372,9 @@ class CuMesh:
             A tuple of two values:
                 - the number of charts
                 - a tensor of shape [F] containing the chart ID for each face.
-                - a tensor of shape [N] containing the vertex map
-                - a tensor of shape [C, 3] containing the chart faces
+                - a tensor of shape [V] containing the vertex map
+                - a tensor of shape [F, 3] containing the chart faces
+                - a tensor of shape [C+1] containing the offsets of the chart vertices in the vertices tensor.
                 - a tensor of shape [C+1] containing the offsets of the chart faces in the faces tensor.
         """
         return self.cu_mesh.read_atlas_charts()
@@ -368,8 +384,9 @@ class CuMesh:
         compute_charts_kwargs: dict={},
         xatlas_compute_charts_kwargs: dict={},
         xatlas_pack_charts_kwargs: dict={},
+        return_vmaps: bool=False,
         verbose: bool=False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Parameterize the mesh using the accelerated mesh clustering and Xatlas
         
@@ -377,12 +394,15 @@ class CuMesh:
             compute_charts_kwargs: a dictionary of options for the compute_charts function.
             xatlas_compute_charts_kwargs: a dictionary of options for the xatlas compute_charts function.
             xatlas_pack_charts_kwargs: a dictionary of options for the xatlas pack_charts function.
+            return_vmaps: whether to return the vertex maps.
+            verbose: whether to print the progress.
             
         Returns:
-            A tuple of three tensors:
+            A tuple of:
                 - the vertex positions
                 - the face indices
                 - the uv coordinates
+                - (optional) the map from the new vertex indices to the old vertex indices
         """
         xatlas_compute_charts_kwargs['verbose'] = verbose
         xatlas_pack_charts_kwargs['verbose'] = verbose
@@ -392,38 +412,44 @@ class CuMesh:
         # 1. Fast mesh clustering
         self.compute_charts(**compute_charts_kwargs)
         new_vertices, new_faces = self.read()
-        num_charts, charts_id, chart_vmap, chart_faces, chart_face_offset = self.read_atlas_charts()
+        num_charts, charts_id, chart_vmap, chart_faces, chart_vertex_offset, chart_face_offset = self.read_atlas_charts()
         chart_vertices = new_vertices[chart_vmap].cpu()
         chart_faces = chart_faces.cpu()
+        chart_vertex_offset = chart_vertex_offset.cpu()
+        chart_face_offset = chart_face_offset.cpu()
+        chart_vmap = chart_vmap.cpu()
         if verbose:
             print(f"Get {num_charts} clusters after fast clustering")
         
         # 2. Xatlas packing
         xatlas = Atlas()
-        charts = []
+        chart_vmaps = []
         for i in tqdm(range(num_charts), desc="Adding clusters to xatlas", disable=not verbose):
-            chart_faces_i = chart_faces[chart_face_offset[i]:chart_face_offset[i+1]]
-            chart_faces_i_min = chart_faces_i.min()
-            chart_faces_i_max = chart_faces_i.max()
-            chart_vertices_i = chart_vertices[chart_faces_i_min:chart_faces_i_max+1]
-            chart_faces_i -= chart_faces_i_min
-            charts.append((chart_vertices_i, chart_faces_i))
+            chart_faces_i = chart_faces[chart_face_offset[i]:chart_face_offset[i+1]] - chart_vertex_offset[i]
+            chart_vertices_i = chart_vertices[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
+            chart_vmap_i = chart_vmap[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
+            chart_vmaps.append(chart_vmap_i)
             xatlas.add_mesh(chart_vertices_i, chart_faces_i)
         xatlas.compute_charts(**xatlas_compute_charts_kwargs)
         xatlas.pack_charts(**xatlas_pack_charts_kwargs)
-        vertices = []
+        vmaps = []
         faces = []
         uvs = []
         cnt = 0
         for i in tqdm(range(num_charts), desc="Gathering results from xatlas", disable=not verbose):
             vmap, x_faces, x_uvs = xatlas.get_mesh(i)
-            vertices.append(charts[i][0][vmap])
+            vmaps.append(chart_vmaps[i][vmap])
             faces.append(x_faces + cnt)
             uvs.append(x_uvs)
             cnt += vmap.shape[0]
-        vertices = torch.cat(vertices, dim=0)
+        vmaps = torch.cat(vmaps, dim=0)
+        vertices = new_vertices.cpu()[vmaps]
         faces = torch.cat(faces, dim=0)
         uvs = torch.cat(uvs, dim=0)
         
-        return vertices, faces, uvs
+        out = [vertices, faces, uvs]
+        if return_vmaps:
+            out.append(vmaps)
+        
+        return tuple(out)
             

@@ -182,8 +182,8 @@ void CuMesh::remove_unreferenced_vertices() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_vertex_is_referenced));
 
-    // Delete all connectivity info since mesh has changed
-    this->clear_connectivity();
+    // Delete all cached info since mesh has changed
+    this->clear_cache();
 }
 
 
@@ -609,8 +609,8 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     CUDA_CHECK(cudaFree(cu_new_loop_boundaries));
     CUDA_CHECK(cudaFree(cu_new_loop_bound_loop_ids));
 
-    // Delete all connectivity info since mesh has changed
-    this->clear_connectivity();
+    // Delete all cached info since mesh has changed
+    this->clear_cache();
 }
 
 
@@ -753,24 +753,8 @@ void CuMesh::repair_non_manifold_edges(){
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_vertex_ids));
 
-    // Delete all connectivity info since mesh has changed
-    this->clear_connectivity();
-}
-
-
-static __global__ void calc_face_areas(
-    const float3* vertices,
-    const int3* faces,
-    const size_t F,
-    float* face_areas
-) {
-    const int fid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (fid >= F) return;
-    int3 face = faces[fid];
-    Vec3f v0 = Vec3f(vertices[face.x]);
-    Vec3f v1 = Vec3f(vertices[face.y]);
-    Vec3f v2 = Vec3f(vertices[face.z]);
-    face_areas[fid] = 0.5 * (v1 - v0).cross(v2 - v0).norm();
+    // Delete all cached info since mesh has changed
+    this->clear_cache();
 }
 
 
@@ -785,21 +769,13 @@ void CuMesh::remove_small_connected_components(float min_area) {
     if (this->conn_comp_ids.is_empty()) {
         this->get_connected_components();
     }
+    if (this->face_areas.is_empty()) {
+        this->compute_face_areas();
+    }
     size_t F = this->faces.size;
     if (F == 0) return;
 
-    // 1. Calculate the area of each individual face.
-    float* cu_face_areas;
-    CUDA_CHECK(cudaMalloc(&cu_face_areas, F * sizeof(float)));
-    calc_face_areas<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        this->vertices.ptr,
-        this->faces.ptr,
-        F,
-        cu_face_areas
-    );
-    CUDA_CHECK(cudaGetLastError());
-
-    // 2. Sort face areas based on their connected component ID.
+    // 1. Sort face areas based on their connected component ID.
     // This groups all faces of the same component together.
     size_t temp_storage_bytes = 0;
     int *cu_sorted_conn_comp_ids;
@@ -809,19 +785,18 @@ void CuMesh::remove_small_connected_components(float min_area) {
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, temp_storage_bytes,
         this->conn_comp_ids.ptr, cu_sorted_conn_comp_ids,
-        cu_face_areas, cu_sorted_face_areas,
+        this->face_areas.ptr, cu_sorted_face_areas,
         F
     ));
     this->cub_temp_storage.resize(temp_storage_bytes);
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         this->cub_temp_storage.ptr, temp_storage_bytes,
         this->conn_comp_ids.ptr, cu_sorted_conn_comp_ids,
-        cu_face_areas, cu_sorted_face_areas,
+        this->face_areas.ptr, cu_sorted_face_areas,
         F
     ));
-    CUDA_CHECK(cudaFree(cu_face_areas)); // Original areas no longer needed.
     
-    // 3. Find unique components and get the number of faces in each.
+    // 2. Find unique components and get the number of faces in each.
     int* cu_conn_comp_num_faces;
     int* cu_num_conn_comps;
     int* cu_unique_conn_comp_ids; // Not needed, but we need to pass a valid pointer.
@@ -847,7 +822,7 @@ void CuMesh::remove_small_connected_components(float min_area) {
     CUDA_CHECK(cudaFree(cu_sorted_conn_comp_ids));
     CUDA_CHECK(cudaFree(cu_unique_conn_comp_ids));
 
-    // 4. Compute the total area for each connected component via segmented reduction.
+    // 3. Compute the total area for each connected component via segmented reduction.
     int* cu_conn_comp_offsets;
     CUDA_CHECK(cudaMalloc(&cu_conn_comp_offsets, (num_conn_comps + 1) * sizeof(int)));
     temp_storage_bytes = 0;
@@ -884,7 +859,7 @@ void CuMesh::remove_small_connected_components(float min_area) {
     CUDA_CHECK(cudaFree(cu_sorted_face_areas));
     CUDA_CHECK(cudaFree(cu_conn_comp_offsets));
 
-    // 5. Create a "keep" mask for components with area >= min_area.
+    // 4. Create a "keep" mask for components with area >= min_area.
     uint8_t* cu_comp_keep_mask;
     CUDA_CHECK(cudaMalloc(&cu_comp_keep_mask, num_conn_comps * sizeof(uint8_t)));
     compare_kernel<<<(num_conn_comps+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
@@ -897,7 +872,7 @@ void CuMesh::remove_small_connected_components(float min_area) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_conn_comp_areas));
 
-    // 6. Propagate the component "keep" mask to every face.
+    // 5. Propagate the component "keep" mask to every face.
     uint8_t* cu_face_keep_mask;
     CUDA_CHECK(cudaMalloc(&cu_face_keep_mask, F * sizeof(uint8_t)));
     // Use an index_kernel (gather operation)
@@ -910,7 +885,7 @@ void CuMesh::remove_small_connected_components(float min_area) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_comp_keep_mask));
     
-    // 7. Select the faces to keep and update the mesh.
+    // 6. Select the faces to keep and update the mesh.
     this->_remove_faces(cu_face_keep_mask);
     CUDA_CHECK(cudaFree(cu_face_keep_mask));
 }
