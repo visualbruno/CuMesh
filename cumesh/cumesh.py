@@ -52,6 +52,12 @@ class CuMesh:
     def num_boundary_loops(self) -> int:
         return self.cu_mesh.num_boundary_loops()
 
+    def clear_cache(self):
+        """
+        Clear the cached data.
+        """
+        self.cu_mesh.clear_cache()
+
     def read(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Read the current vertices and faces from the CuMesh.
@@ -149,6 +155,15 @@ class CuMesh:
                 - a tensor of shape [N_loops + 1] containing the offsets of the boundary edges in each loop.
         """
         return self.cu_mesh.read_boundary_loops()
+    
+    def read_all_cache(self) -> Dict[str, torch.Tensor]:
+        """
+        Read all cached data.
+
+        Returns:
+            A dictionary of cached data.
+        """
+        return self.cu_mesh.read_all_cache()
     
     def compute_face_normals(self):
         """

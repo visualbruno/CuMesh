@@ -27,7 +27,6 @@ public:
     Buffer<int> boundaries;
     Buffer<uint8_t> vert_is_boundary;
     Buffer<uint8_t> vert_is_manifold;
-    Buffer<uint8_t> edge_is_manifold;
     Buffer<int> vert2edge;
     Buffer<int> vert2edge_cnt;
     Buffer<int> vert2edge_offset;
@@ -186,6 +185,13 @@ public:
      * - The boundary loops offsets as an [L+1] tensor.
      */
     std::tuple<int, torch::Tensor, torch::Tensor> read_boundary_loops();
+
+    /**
+     * Get all cached data.
+     * 
+     * @return A dictionary of all cached data.
+     */
+    std::unordered_map<std::string, torch::Tensor> read_all_cache();
     
 
     // Geometric functions
@@ -285,15 +291,6 @@ public:
     /**
      * Get edge is manifold information.
      * This function requires:
-     * - edge2face_cnt
-     * This function refreshes:
-     * - edge_is_manifold
-     */
-    void get_edge_is_manifold();
-
-    /**
-     * Get edge is manifold information.
-     * This function requires:
      * - vert2edge
      * - vert2edge_offset
      * - edge2face_cnt
@@ -305,7 +302,6 @@ public:
     /**
      * Get the face adjacency for manifold edges.
      * This function requires:
-     * - edge_is_manifold
      * - edge2face
      * - edge2face_offset
      * This function refreshes:

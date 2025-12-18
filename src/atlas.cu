@@ -567,6 +567,7 @@ void compute_chart_normal_cones(
         C,
         cu_chart_offsets, cu_chart_offsets + 1
     ));
+    CUDA_CHECK(cudaFree(cu_sorted_face_areas));
 
     float3* cu_sorted_face_normals;
     CUDA_CHECK(cudaMalloc(&cu_sorted_face_normals, F * sizeof(float3)));

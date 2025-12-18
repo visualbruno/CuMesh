@@ -1053,6 +1053,7 @@ void CuMesh::unify_face_orientations() {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpy(&h_end_flag, cu_end_flag, sizeof(int), cudaMemcpyDeviceToHost));
     } while (h_end_flag == 0);
+    CUDA_CHECK(cudaFree(cu_end_flag));
 
     // 3. Flip the orientation of the faces.
     inplace_flip_faces_with_flags_kernel<<<(this->faces.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
@@ -1061,6 +1062,8 @@ void CuMesh::unify_face_orientations() {
         this->faces.size
     );
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaFree(cu_flipped));
+    CUDA_CHECK(cudaFree(conn_comp_with_flip));
 }
 
 

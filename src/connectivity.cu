@@ -157,6 +157,7 @@ void CuMesh::get_edges() {
         F * 3
     ));
     CUDA_CHECK(cudaMemcpy(&this->edges.size, num_edges, sizeof(int), cudaMemcpyDeviceToHost));
+    this->edge2face_cnt.size = this->edges.size;
     CUDA_CHECK(cudaFree(num_edges));
 }
 
@@ -552,36 +553,6 @@ void CuMesh::get_vertex_boundary_adjacency() {
 }
 
 
-/**
- * Set manifold edge indicator
- * 
- * @param edge2face_cnt: the buffer for edge duplication number, shape (E)
- * @param E: the number of edges
- * @param edge_is_manifold: the buffer for manifold edge indicator, shape (E)
- */
-static __global__ void get_edge_is_manifold_kernel(
-    const int* edge2face_cnt,
-    const int E,
-    uint8_t* edge_is_manifold
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= E) return;
-    edge_is_manifold[tid] = (edge2face_cnt[tid] <= 2) ? 1 : 0;
-}
-
-
-void CuMesh::get_edge_is_manifold() {
-    if (this->edge2face_cnt.is_empty()) {
-        this->get_edges();
-    }
-    this->edge_is_manifold.resize(this->edges.size);
-    get_edge_is_manifold_kernel<<<(this->edges.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
-        this->edge2face_cnt.ptr, this->edges.size, this->edge_is_manifold.ptr
-    );
-    CUDA_CHECK(cudaGetLastError());
-}
-
-
 static __global__ void get_vertex_is_manifold_kernel(
     const int* vert2edge,
     const int* vert2edge_offset,
@@ -671,12 +642,18 @@ static __global__ void set_manifold_face_adj_kernel(
 }
 
 
+struct is_manifold_edge {
+    const int* edge2face_cnt;
+    __host__ __device__
+    bool operator()(const int& idx) const {
+        return edge2face_cnt[idx] == 2;
+    }
+};
+
+
 void CuMesh::get_manifold_face_adjacency() {
     if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
         this->get_edge_face_adjacency();
-    }
-    if (this->edge_is_manifold.is_empty()) {
-        this->get_edge_is_manifold();
     }
     size_t E = this->edges.size;
     size_t F = this->faces.size;
@@ -689,16 +666,18 @@ void CuMesh::get_manifold_face_adjacency() {
     CUDA_CHECK(cudaMalloc(&cu_manifold_edge_idx, E * sizeof(int)));
     arange_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(cu_edge_idx, E);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
+    CUDA_CHECK(cub::DeviceSelect::If(
         nullptr, temp_storage_bytes,
-        cu_edge_idx, this->edge_is_manifold.ptr, cu_manifold_edge_idx, cu_num_manifold_edges,
-        E
+        cu_edge_idx, cu_manifold_edge_idx, cu_num_manifold_edges,
+        E,
+        is_manifold_edge{this->edge2face_cnt.ptr}
     ));
     this->cub_temp_storage.resize(temp_storage_bytes);
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
+    CUDA_CHECK(cub::DeviceSelect::If(
         this->cub_temp_storage.ptr, temp_storage_bytes,
-        cu_edge_idx, this->edge_is_manifold.ptr, cu_manifold_edge_idx, cu_num_manifold_edges,
-        E
+        cu_edge_idx, cu_manifold_edge_idx, cu_num_manifold_edges,
+        E,
+        is_manifold_edge{this->edge2face_cnt.ptr}
     ));
     int manifold_edge_count;
     CUDA_CHECK(cudaMemcpy(&manifold_edge_count, cu_num_manifold_edges, sizeof(int), cudaMemcpyDeviceToHost));
