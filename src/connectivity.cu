@@ -415,7 +415,7 @@ void CuMesh::get_boundary_info() {
 
     // Select boundary edges
     size_t temp_storage_bytes = 0;
-    int *cu_num_boundary, *cu_edge_idx, *cu_manifold_edge_idx;
+    int *cu_num_boundary, *cu_edge_idx;
     CUDA_CHECK(cudaMalloc(&cu_num_boundary, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&cu_edge_idx, E * sizeof(int)));
     this->boundaries.resize(E);
@@ -513,9 +513,17 @@ void CuMesh::get_vertex_boundary_adjacency() {
     if (this->boundaries.is_empty()) {
         this->get_boundary_info();
     }
-    size_t E = this->edges.size;
     size_t V = this->vertices.size;
     size_t B = this->boundaries.size;
+
+    // Early return if no boundaries
+    if (B == 0) {
+        this->vert2bound_cnt.resize(V + 1);
+        this->vert2bound_cnt.zero();
+        this->vert2bound_offset.resize(V + 1);
+        this->vert2bound_offset.zero();
+        return;
+    }
 
     // get vertex adjacent boundary number
     this->vert2bound_cnt.resize(V + 1);
@@ -656,7 +664,6 @@ void CuMesh::get_manifold_face_adjacency() {
         this->get_edge_face_adjacency();
     }
     size_t E = this->edges.size;
-    size_t F = this->faces.size;
 
     // Select manifold edges
     size_t temp_storage_bytes = 0;
@@ -737,7 +744,6 @@ void CuMesh::get_manifold_boundary_adjacency() {
         this->get_vertex_is_manifold();
     }
     size_t V = this->vertices.size;
-    size_t B = this->boundaries.size;
 
     // Select manifold boundary vertices
     size_t temp_storage_bytes = 0;
@@ -764,6 +770,12 @@ void CuMesh::get_manifold_boundary_adjacency() {
     CUDA_CHECK(cudaMemcpy(&manifold_boundary_vert_count, cu_num_manifold_boundary_verts, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(cu_num_manifold_boundary_verts));
     CUDA_CHECK(cudaFree(cu_vert_idx));
+
+    // Early return if no manifold boundary vertices
+    if (manifold_boundary_vert_count == 0) {
+        CUDA_CHECK(cudaFree(cu_manifold_vert_idx));
+        return;
+    }
 
     // set manifold_bound_adj
     this->manifold_bound_adj.resize(manifold_boundary_vert_count);
@@ -826,6 +838,12 @@ void CuMesh::get_boundary_connected_components() {
     }
     size_t M = this->manifold_bound_adj.size;
     size_t B = this->boundaries.size;
+
+    // Early return if no boundaries
+    if (B == 0) {
+        this->num_bound_conn_comps = 0;
+        return;
+    }
 
     // Iterative Hook and Compress
     this->bound_conn_comp_ids.resize(B);
@@ -913,6 +931,12 @@ void CuMesh::get_boundary_loops() {
     }
 
     size_t B = this->boundaries.size;
+
+    // Early return if no boundaries or boundary components
+    if (B == 0 || this->num_bound_conn_comps == 0) {
+        this->num_bound_loops = 0;
+        return;
+    }
 
     // Check if boundary components are loops
     int* cu_is_bound_conn_comp_loop;

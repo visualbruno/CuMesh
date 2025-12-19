@@ -55,7 +55,7 @@ void CuMesh::remove_faces(torch::Tensor& face_mask) {
     CUDA_CHECK(cudaMemcpy(this->faces.ptr, cu_new_faces, new_num_faces * sizeof(int3), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaFree(cu_new_num_faces));
     CUDA_CHECK(cudaFree(cu_new_faces));
-    
+
     this->remove_unreferenced_vertices();
 }
 
@@ -85,7 +85,7 @@ void CuMesh::_remove_faces(uint8_t* face_mask) {
     CUDA_CHECK(cudaMemcpy(this->faces.ptr, cu_new_faces, new_num_faces * sizeof(int3), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaFree(cu_new_num_faces));
     CUDA_CHECK(cudaFree(cu_new_faces));
-    
+
     this->remove_unreferenced_vertices();
 }
 
@@ -372,6 +372,11 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     size_t L = this->num_bound_loops;
     size_t E = this->loop_boundaries.size;
 
+    // Early return if no boundary loops
+    if (L == 0 || E == 0) {
+        return;
+    }
+
     // Compute loop boundary lengths
     float* cu_loop_boundary_lengths;
     CUDA_CHECK(cudaMalloc(&cu_loop_boundary_lengths, E * sizeof(float)));
@@ -475,7 +480,7 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
         cu_loop_bound_loop_ids,
         E
     ));
-    
+
     // Mask loop boundaries
     uint8_t* cu_loop_boundary_mask;
     CUDA_CHECK(cudaMalloc(&cu_loop_boundary_mask, E * sizeof(uint8_t)));
@@ -547,7 +552,7 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
         cu_new_loop_bound_loop_ids,
         new_num_loop_boundaries
     ));
-    
+
     // Calculate new vertex positions as average of loop vertices
     Vec3f* cu_new_loop_bound_centers;
     CUDA_CHECK(cudaMalloc(&cu_new_loop_bound_centers, new_num_loop_boundaries * sizeof(Vec3f)));
@@ -622,15 +627,15 @@ static __global__ void construct_vertex_adj_pairs_kernel(
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= M) return;
-    
+
     const int2 adj_faces = manifold_face_adj[tid];
     const int3 face1 = faces[adj_faces.x];
     const int3 face2 = faces[adj_faces.y];
 
     const int v1[3] = {face1.x, face1.y, face1.z};
 
-    int shared_local_indices1[2];
-    int shared_local_indices2[2];
+    int shared_local_indices1[2] = {0, 0};
+    int shared_local_indices2[2] = {0, 0};
     int found_count = 0;
 
     for (int i = 0; i < 3; ++i) {
@@ -651,15 +656,22 @@ static __global__ void construct_vertex_adj_pairs_kernel(
             break;
         }
     }
-    
-    vertex_adj_pairs[2 * tid + 0] = make_int2(
-        3 * adj_faces.x + shared_local_indices1[0], 
-        3 * adj_faces.y + shared_local_indices2[0]
-    );
-    vertex_adj_pairs[2 * tid + 1] = make_int2(
-        3 * adj_faces.x + shared_local_indices1[1], 
-        3 * adj_faces.y + shared_local_indices2[1]
-    );
+
+    // Only process if we found exactly 2 shared vertices (valid manifold edge)
+    if (found_count == 2) {
+        vertex_adj_pairs[2 * tid + 0] = make_int2(
+            3 * adj_faces.x + shared_local_indices1[0],
+            3 * adj_faces.y + shared_local_indices2[0]
+        );
+        vertex_adj_pairs[2 * tid + 1] = make_int2(
+            3 * adj_faces.x + shared_local_indices1[1],
+            3 * adj_faces.y + shared_local_indices2[1]
+        );
+    } else {
+        // Invalid edge, set to identity mapping
+        vertex_adj_pairs[2 * tid + 0] = make_int2(3 * adj_faces.x, 3 * adj_faces.x);
+        vertex_adj_pairs[2 * tid + 1] = make_int2(3 * adj_faces.y, 3 * adj_faces.y);
+    }
 }
 
 
@@ -680,11 +692,10 @@ static __global__ void index_vertice_kernel(
 
 
 void CuMesh::repair_non_manifold_edges(){
-    if (this->manifold_face_adj.is_empty()) {
-        this->get_manifold_face_adjacency();
-    }
+    // Always recompute manifold_face_adj to ensure it's up to date
+    // especially after operations like simplify() that modify the mesh
+    this->get_manifold_face_adjacency();
 
-    size_t V = this->vertices.size;
     size_t F = this->faces.size;
     size_t M = this->manifold_face_adj.size;
 
@@ -795,7 +806,7 @@ void CuMesh::remove_small_connected_components(float min_area) {
         this->face_areas.ptr, cu_sorted_face_areas,
         F
     ));
-    
+
     // 2. Find unique components and get the number of faces in each.
     int* cu_conn_comp_num_faces;
     int* cu_num_conn_comps;
@@ -884,7 +895,7 @@ void CuMesh::remove_small_connected_components(float min_area) {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_comp_keep_mask));
-    
+
     // 6. Select the faces to keep and update the mesh.
     this->_remove_faces(cu_face_keep_mask);
     CUDA_CHECK(cudaFree(cu_face_keep_mask));
@@ -919,7 +930,7 @@ static __global__ void hook_edges_with_orientation_kernel(
     while (root1 != (conn_comp_ids[root1] >> 1)) {
         flip1 ^= conn_comp_ids[root1] & 1;
         root1 = conn_comp_ids[root1] >> 1;
-    } 
+    }
 
     if (root0 == root1) return;
 
@@ -937,7 +948,6 @@ static __global__ void compress_components_with_orientation_kernel(
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= F) return;
 
-    int is_flipped = 0;
     int p = conn_comp_ids[tid] >> 1;
     int f = conn_comp_ids[tid] & 1;
     while (p != (conn_comp_ids[p] >> 1)) {
@@ -1044,7 +1054,7 @@ void CuMesh::unify_face_orientations() {
             cu_end_flag
         );
         CUDA_CHECK(cudaGetLastError());
-        
+
         // Compress
         compress_components_with_orientation_kernel<<<(this->faces.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
             conn_comp_with_flip,
