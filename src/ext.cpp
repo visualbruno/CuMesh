@@ -54,6 +54,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("remove_duplicate_faces", &cumesh::CuMesh::remove_duplicate_faces)
         .def("fill_holes", &cumesh::CuMesh::fill_holes)
         .def("repair_non_manifold_edges", &cumesh::CuMesh::repair_non_manifold_edges)
+        .def("remove_non_manifold_faces", &cumesh::CuMesh::remove_non_manifold_faces)
         .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
         .def("simplify_step", &cumesh::CuMesh::simplify_step)

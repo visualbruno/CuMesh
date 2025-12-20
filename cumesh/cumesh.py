@@ -287,9 +287,18 @@ class CuMesh:
         
     def repair_non_manifold_edges(self):
         """
-        Repair Non-manifold edges by splitting edges
+        Repair Non-manifold edges by splitting vertices.
+        This creates duplicate vertices with the same coordinates.
         """
         self.cu_mesh.repair_non_manifold_edges()
+
+    def remove_non_manifold_faces(self):
+        """
+        Remove faces on non-manifold edges.
+        For each non-manifold edge (shared by >2 faces), only keep the first 2 faces.
+        This repairs non-manifold edges by deleting faces instead of splitting vertices.
+        """
+        self.cu_mesh.remove_non_manifold_faces()
         
     def remove_small_connected_components(self, min_area: float):
         """

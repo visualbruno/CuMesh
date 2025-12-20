@@ -393,6 +393,22 @@ public:
     void repair_non_manifold_edges();
 
     /**
+     * Remove faces on non-manifold edges.
+     * For each non-manifold edge (shared by >2 faces), only keep the first 2 faces.
+     * This repairs non-manifold edges by deleting faces instead of splitting vertices.
+     * This function requires:
+     * - edge2face
+     * - edge2face_offset
+     * - edge2face_cnt
+     * This function refreshes:
+     * - vertices
+     * - faces
+     * This function destroys:
+     * - All connectivity information
+     */
+    void remove_non_manifold_faces();
+
+    /**
      * Remove small connected components.
      * This function requires:
      * - conn_comp_ids

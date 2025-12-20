@@ -769,6 +769,74 @@ void CuMesh::repair_non_manifold_edges(){
 }
 
 
+/**
+ * Mark faces to remove for non-manifold edges
+ * For each non-manifold edge (shared by >2 faces), only keep the first 2 faces
+ * 
+ * @param edge2face: edge to face adjacency
+ * @param edge2face_offset: edge to face adjacency offset
+ * @param edge2face_cnt: number of faces per edge
+ * @param E: number of edges
+ * @param face_keep_mask: output mask (1 = keep, 0 = remove)
+ */
+static __global__ void mark_non_manifold_faces_kernel(
+    const int* edge2face,
+    const int* edge2face_offset,
+    const int* edge2face_cnt,
+    const size_t E,
+    uint8_t* face_keep_mask
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= E) return;
+
+    // Only process non-manifold edges (cnt > 2)
+    int cnt = edge2face_cnt[tid];
+    if (cnt <= 2) return;
+
+    // Mark faces beyond the first 2 for removal
+    int start = edge2face_offset[tid];
+    for (int i = 2; i < cnt; i++) {
+        int face_idx = edge2face[start + i];
+        face_keep_mask[face_idx] = 0;
+    }
+}
+
+
+void CuMesh::remove_non_manifold_faces() {
+    // Get edge-face adjacency information
+    if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
+        this->get_edge_face_adjacency();
+    }
+
+    size_t F = this->faces.size;
+    size_t E = this->edges.size;
+
+    if (F == 0 || E == 0) return;
+
+    // Initialize face mask (1 = keep all faces initially)
+    uint8_t* cu_face_keep_mask;
+    CUDA_CHECK(cudaMalloc(&cu_face_keep_mask, F * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemset(cu_face_keep_mask, 1, F * sizeof(uint8_t)));
+
+    // Mark faces on non-manifold edges for removal
+    mark_non_manifold_faces_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        this->edge2face.ptr,
+        this->edge2face_offset.ptr,
+        this->edge2face_cnt.ptr,
+        E,
+        cu_face_keep_mask
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Remove marked faces
+    this->_remove_faces(cu_face_keep_mask);
+    CUDA_CHECK(cudaFree(cu_face_keep_mask));
+
+    // Clear cache since mesh has changed
+    this->clear_cache();
+}
+
+
 struct GreaterThanOrEqualToOp {
     __device__ __forceinline__ bool operator()(const float& a, const float& b) const {
         return a >= b;
