@@ -19,15 +19,15 @@ struct TriangleBvhNode {
 };
 
 
-template <typename T, int MAX_SIZE=32>
+template <typename T, int MAX_SIZE=128>
 class FixedStack {
 public:
     __host__ __device__ void push(T val) {
         // If overflowing, flag and drop the push; a stackless fallback will be used.
         if (m_count >= MAX_SIZE) {
-            if (!m_overflowed) {
-                printf("WARNING TOO BIG (stack overflow)\n");
-            }
+            //if (!m_overflowed) {
+            //    printf("WARNING TOO BIG (stack overflow)\n");
+            //}
             m_overflowed = true;
             return;
         }
@@ -53,6 +53,7 @@ private:
 };
 
 using FixedIntStack = FixedStack<int>;
+using FixedLongStack = FixedStack<long>;
 
 
 class TriangleBvh {
