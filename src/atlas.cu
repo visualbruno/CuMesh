@@ -6,6 +6,12 @@
 
 namespace cumesh {
 
+// Move the logic outside the function call
+#if CUDART_VERSION >= 12090
+    auto reduction_op = ::cuda::std::plus();
+#else
+    auto reduction_op = cub::Sum();
+#endif
 
 /*
 Fast mesh parameterization / UV unwrapping using GPU
@@ -333,7 +339,7 @@ static void get_chart_connectivity(
         cu_sorted_lengths,
         mesh.atlas_chart_adj_length.ptr,
         cu_num_chart_adjs,
-        cub::Sum(),
+        reduction_op,
         M
     ));
     mesh.cub_temp_storage.resize(temp_storage_bytes);
@@ -344,7 +350,7 @@ static void get_chart_connectivity(
         cu_sorted_lengths,
         mesh.atlas_chart_adj_length.ptr,
         cu_num_chart_adjs,
-        cub::Sum(),
+        reduction_op,
         M
     ));
     CUDA_CHECK(cudaMemcpy(&mesh.atlas_chart_adj.size, cu_num_chart_adjs, sizeof(int), cudaMemcpyDeviceToHost));
