@@ -43,35 +43,25 @@ def remesh_narrow_band_dc(
     project_back: float = 0,
     verbose: bool = False,
     bvh = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Optimized Remeshing using Morton-coded chunks, Dual Contouring, 
-    Laplacian relaxation, and spatial projection.
-    """
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = vertices.device
     
-    # -------------------------------------------------------------------------
-    # 1. Constants & Lazy Initialization
-    # -------------------------------------------------------------------------
+    # --- 1. Constants ---
     if not hasattr(remesh_narrow_band_dc, "edge_neighbor_voxel_offset"):
         remesh_narrow_band_dc.edge_neighbor_voxel_offset = torch.tensor([
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],     # x-axis
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],     # y-axis
-            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],     # z-axis
+            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
         ], dtype=torch.int32).unsqueeze(0).to(device)
 
-    # Triangle split tables
     s1_n, s1_p = torch.tensor([0, 1, 2, 0, 2, 3], device=device), torch.tensor([0, 2, 1, 0, 3, 2], device=device)
     s2_n, s2_p = torch.tensor([0, 1, 3, 3, 1, 2], device=device), torch.tensor([0, 3, 1, 3, 2, 1], device=device)
+    OFFSETS = torch.tensor([[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]], dtype=torch.int32, device=device)
 
-    OFFSETS = torch.tensor([
-        [0,0,0], [1,0,0], [0,1,0], [1,1,0], [0,0,1], [1,0,1], [0,1,1], [1,1,1]
-    ], dtype=torch.int32, device=device)
-
-    # -------------------------------------------------------------------------
-    # 2. Helpers: Morton Sorting & Chunked Distance
-    # -------------------------------------------------------------------------
+    # --- 2. Memory-Safe Helpers ---
     def get_morton_indices(coords: torch.Tensor):
+        if coords.shape[0] > 10_000_000: # Skip sorting if too large to avoid argsort OOM
+            return torch.arange(coords.shape[0], device=device)
         c = coords.long()
         def spread(x):
             x = (x | (x << 16)) & 0x030000FF0000FF
@@ -82,7 +72,7 @@ def remesh_narrow_band_dc(
         morton = (spread(c[:, 0]) << 2) | (spread(c[:, 1]) << 1) | spread(c[:, 2])
         return torch.argsort(morton)
 
-    def chunked_udf(bvh_ptr, pts, chunk_size=1048576, return_uvw=False):
+    def chunked_udf(bvh_ptr, pts, chunk_size=524288, return_uvw=False):
         N = pts.shape[0]
         distances = torch.empty(N, dtype=torch.float32, device=device)
         face_ids = torch.empty(N, dtype=torch.int64, device=device)
@@ -94,72 +84,42 @@ def remesh_narrow_band_dc(
             if return_uvw: uvws[i:end] = u
         return distances, face_ids, uvws
 
-    # -------------------------------------------------------------------------
-    # 3. Sparse Grid Construction (Z-Order Optimized)
-    # -------------------------------------------------------------------------
-    if bvh is None:
-        if verbose: print("Building BVH...")
-        bvh = cuBVH(vertices, faces)
-    
+    # --- 3. Sparse Grid Construction ---
+    if bvh is None: bvh = cuBVH(vertices, faces)
     eps = band * scale / resolution
     base_res = resolution
     while base_res > 32: base_res //= 2
     
-    # 1. Initial coarse grid
-    coords = torch.stack(torch.meshgrid(
-        torch.arange(base_res, device=device),
-        torch.arange(base_res, device=device),
-        torch.arange(base_res, device=device),
-        indexing='ij'
-    ), dim=-1).int().reshape(-1, 3)
+    coords = torch.stack(torch.meshgrid(torch.arange(base_res, device=device), torch.arange(base_res, device=device), torch.arange(base_res, device=device), indexing='ij'), dim=-1).int().reshape(-1, 3)
     
-    # Apply Morton sort to initial grid
-    coords = coords[get_morton_indices(coords)]
-
-    pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_res)).item()) + 1, 
-                desc="Sparse Grid", disable=not verbose)
-
+    pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_res)).item()) + 1, desc="Sparse Grid", disable=not verbose)
     while True:
-        # Update progress bar at start of iteration
         pbar.update(1)
-        
         cell_size = scale / base_res
         pts = ((coords.float() + 0.5) / base_res - 0.5) * scale + center
-        
-        # Optimized chunked distance with spatial locality
         dist, _, _ = chunked_udf(bvh, pts)
         coords = coords[torch.abs(dist - eps) < 0.87 * cell_size]
-        
-        if base_res >= resolution:
-            break
-            
+        if base_res >= resolution: break
         base_res *= 2
         coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
-        
-        # Re-sort after subdivision to maintain spatial locality for next UDF call
-        coords = coords[get_morton_indices(coords)]
-        
+        # Spatial sorting is most important at the final high-res steps
+        if coords.shape[0] < 8_000_000:
+            coords = coords[get_morton_indices(coords)]
     pbar.close()
 
-    # -------------------------------------------------------------------------
-    # 4. Dual Contouring Kernels
-    # -------------------------------------------------------------------------
+    # --- 4. Dual Contouring Kernels ---
     Nvox = coords.shape[0]
     hashmap_vox = _init_hashmap(resolution, 2 * Nvox, device)
     _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vox, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1), resolution, resolution, resolution)
-    
     grid_verts = _C.get_sparse_voxel_grid_active_vertices(*hashmap_vox, coords.contiguous(), resolution, resolution, resolution)
     pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
     dist_vert, _, _ = chunked_udf(bvh, pts_vert)
-    
     hashmap_vert = _init_hashmap(resolution + 1, 2 * grid_verts.shape[0], device)
     _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vert, torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1), resolution+1, resolution+1, resolution+1)
     dual_verts, intersected = _C.simple_dual_contour(*hashmap_vert, coords, dist_vert - eps, resolution+1, resolution+1, resolution+1)
 
-    # -------------------------------------------------------------------------
-    # 5. Topology (Chunked for Memory)
-    # -------------------------------------------------------------------------
-    quad_list, dir_list, chunk_size = [], [], 1048576
+    # --- 5. Topology (Memory Safe Re-indexing) ---
+    quad_list, dir_list, chunk_size = [], [], 524288
     non_zero = torch.nonzero(intersected)
     for i in range(0, non_zero.shape[0], chunk_size):
         chunk = non_zero[i:i+chunk_size]
@@ -175,52 +135,74 @@ def remesh_narrow_band_dc(
     quad_indices = torch.cat(quad_list, dim=0)
     intersected_dir = torch.cat(dir_list, dim=0).int()
 
-    # Re-index to remove unused vertices
-    unique_v, inv_idx = torch.unique(quad_indices, return_inverse=True)
-    dual_verts = dual_verts[unique_v]
-    quad_indices = inv_idx.reshape(-1, 4).int()
+    # Re-indexing without torch.unique to save memory
+    active_mask = torch.zeros(Nvox, dtype=torch.bool, device=device)
+    active_mask[quad_indices.flatten().long()] = True
+    vert_map = torch.full((Nvox,), -1, dtype=torch.int32, device=device)
+    vert_map[active_mask] = torch.arange(active_mask.sum().item(), dtype=torch.int32, device=device)
+    dual_verts = dual_verts[active_mask]
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        quad_indices[i:end] = vert_map[quad_indices[i:end].long()]
     mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
 
     # -------------------------------------------------------------------------
-    # 6. Smoothing & Detail Projection
+    # 6. Memory-Safe Smoothing & Detail Projection
     # -------------------------------------------------------------------------
     if project_back > 0:
-        if verbose: print("Relaxing & Projecting...")
-        # Laplacian Smoothing for topological quality
-        row, col = quad_indices[:, [0,1,2,3]].flatten(), quad_indices[:, [1,2,3,0]].flatten()
-        adj = torch.sparse_coo_tensor(torch.stack([torch.cat([row,col]), torch.cat([col,row])]), torch.ones(row.shape[0]*2, device=device), (mesh_vertices.shape[0], mesh_vertices.shape[0]))
-        deg = torch.sparse.sum(adj, dim=1).to_dense().clamp(min=1).unsqueeze(-1)
-        for _ in range(3): mesh_vertices = torch.sparse.mm(adj, mesh_vertices) / deg
+        if verbose: print("Relaxing topology (Chunked)...")
         
-        # Spatially sorted projection for BVH cache locality
+        # We use a chunked approach to calculate neighbor averages without a sparse matrix
+        num_v = mesh_vertices.shape[0]
+        for _ in range(3): # 3 Iterations of smoothing
+            v_sum = torch.zeros_like(mesh_vertices)
+            v_count = torch.zeros((num_v, 1), device=device)
+            
+            # Process triangles in chunks to accumulate neighbor positions
+            for i in range(0, quad_indices.shape[0], chunk_size):
+                end = min(i + chunk_size, quad_indices.shape[0])
+                q = quad_indices[i:end].long()
+                
+                # Each vertex in a quad has two neighbors along the quad edges
+                # We accumulate their positions to calculate the local average
+                for idx, next_idx in [(0,1), (1,2), (2,3), (3,0)]:
+                    v_sum.index_add_(0, q[:, idx], mesh_vertices[q[:, next_idx]])
+                    v_sum.index_add_(0, q[:, next_idx], mesh_vertices[q[:, idx]])
+                    v_count.index_add_(0, q[:, idx], torch.ones((q.shape[0], 1), device=device))
+                    v_count.index_add_(0, q[:, next_idx], torch.ones((q.shape[0], 1), device=device))
+            
+            # Update positions: Move toward average of neighbors
+            mesh_vertices = v_sum / v_count.clamp(min=1)
+
+        # --- Optimized Project Back ---
+        if verbose: print("Projecting back to original mesh...")
         v_c = ((mesh_vertices - center) / scale + 0.5) * resolution
-        sort_idx = get_morton_indices(v_c.clamp(0, resolution - 1))
-        inv_sort = torch.empty_like(sort_idx); inv_sort[sort_idx] = torch.arange(sort_idx.size(0), device=device)
-        
-        _, f_id_s, uvw_s = chunked_udf(bvh, mesh_vertices[sort_idx], return_uvw=True)
-        proj_v = (vertices[faces[f_id_s[inv_sort].long()]] * uvw_s[inv_sort].unsqueeze(-1)).sum(dim=1)
+        # Sort only if manageable
+        if v_c.shape[0] < 8_000_000:
+            sort_idx = get_morton_indices(v_c.clamp(0, resolution - 1))
+            inv_sort = torch.empty_like(sort_idx); inv_sort[sort_idx] = torch.arange(sort_idx.size(0), device=device)
+            _, f_id_s, uvw_s = chunked_udf(bvh, mesh_vertices[sort_idx], return_uvw=True)
+            proj_v = (vertices[faces[f_id_s[inv_sort].long()]] * uvw_s[inv_sort].unsqueeze(-1)).sum(dim=1)
+        else:
+            _, f_id, uvw = chunked_udf(bvh, mesh_vertices, return_uvw=True)
+            proj_v = (vertices[faces[f_id.long()]] * uvw.unsqueeze(-1)).sum(dim=1)
+            
         mesh_vertices = mesh_vertices + project_back * (proj_v - mesh_vertices)
 
-    # -------------------------------------------------------------------------
-    # 7. Final Triangle Construction
-    # -------------------------------------------------------------------------
+    # --- 7. Triangulation ---
     mesh_triangles = torch.empty((quad_indices.shape[0] * 2, 3), dtype=torch.int32, device=device)
     for i in range(0, quad_indices.shape[0], chunk_size):
         end = min(i + chunk_size, quad_indices.shape[0])
         q, d = quad_indices[i:end], intersected_dir[i:end].unsqueeze(1)
-        
-        # Test Split 1
         t1 = torch.where(d == 1, q[:, s1_p], q[:, s1_n])
-        n1_a = torch.cross(mesh_vertices[t1[:,1]]-mesh_vertices[t1[:,0]], mesh_vertices[t1[:,2]]-mesh_vertices[t1[:,0]])
-        n1_b = torch.cross(mesh_vertices[t1[:,4]]-mesh_vertices[t1[:,3]], mesh_vertices[t1[:,5]]-mesh_vertices[t1[:,3]])
-        align1 = (n1_a * n1_b).sum(dim=1).abs()
-        
-        # Test Split 2
         t2 = torch.where(d == 1, q[:, s2_p], q[:, s2_n])
-        n2_a = torch.cross(mesh_vertices[t2[:,1]]-mesh_vertices[t2[:,0]], mesh_vertices[t2[:,2]]-mesh_vertices[t2[:,0]])
-        n2_b = torch.cross(mesh_vertices[t2[:,4]]-mesh_vertices[t2[:,3]], mesh_vertices[t2[:,5]]-mesh_vertices[t2[:,3]])
+        # Choose split based on normal alignment
+        n1_a = torch.cross(mesh_vertices[t1[:,1].long()]-mesh_vertices[t1[:,0].long()], mesh_vertices[t1[:,2].long()]-mesh_vertices[t1[:,0].long()])
+        n1_b = torch.cross(mesh_vertices[t1[:,4].long()]-mesh_vertices[t1[:,3]].long(), mesh_vertices[t1[:,5].long()]-mesh_vertices[t1[:,3]].long())
+        align1 = (n1_a * n1_b).sum(dim=1).abs()
+        n2_a = torch.cross(mesh_vertices[t2[:,1].long()]-mesh_vertices[t2[:,0].long()], mesh_vertices[t2[:,2].long()]-mesh_vertices[t2[:,0].long()])
+        n2_b = torch.cross(mesh_vertices[t2[:,4].long()]-mesh_vertices[t2[:,3].long()], mesh_vertices[t2[:,5].long()]-mesh_vertices[t2[:,3]].long())
         align2 = (n2_a * n2_b).sum(dim=1).abs()
-        
         mesh_triangles[i*2:end*2] = torch.where((align1 > align2).unsqueeze(1), t1, t2).reshape(-1, 3)
 
     return mesh_vertices, mesh_triangles
