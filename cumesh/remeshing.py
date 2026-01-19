@@ -47,12 +47,12 @@ def remesh_narrow_band_dc(
     device = vertices.device
     
     # --- 1. Constants ---
-    if not hasattr(remesh_narrow_band_dc, "edge_neighbor_voxel_offset"):
-        remesh_narrow_band_dc.edge_neighbor_voxel_offset = torch.tensor([
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
-            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
-        ], dtype=torch.int32).unsqueeze(0).to(device)
+    # Always create on the current device - don't cache across calls to avoid device mismatch
+    edge_neighbor_voxel_offset = torch.tensor([
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+    ], dtype=torch.int32, device=device).unsqueeze(0)
 
     s1_n, s1_p = torch.tensor([0, 1, 2, 0, 2, 3], device=device), torch.tensor([0, 2, 1, 0, 3, 2], device=device)
     s2_n, s2_p = torch.tensor([0, 1, 3, 3, 1, 2], device=device), torch.tensor([0, 3, 1, 3, 2, 1], device=device)
@@ -124,7 +124,7 @@ def remesh_narrow_band_dc(
     for i in range(0, non_zero.shape[0], chunk_size):
         chunk = non_zero[i:i+chunk_size]
         v_idx, a_idx = chunk[:, 0], chunk[:, 1]
-        neighs = coords[v_idx].unsqueeze(1) + remesh_narrow_band_dc.edge_neighbor_voxel_offset[0, a_idx]
+        neighs = coords[v_idx].unsqueeze(1) + edge_neighbor_voxel_offset[0, a_idx]
         keys = torch.cat([torch.zeros((neighs.shape[0]*4, 1), dtype=torch.int, device=device), neighs.reshape(-1, 3)], dim=1)
         lookup = _C.hashmap_lookup_3d_cuda(*hashmap_vox, keys, resolution, resolution, resolution).reshape(-1, 4).int()
         mask = (lookup != 0xffffffff).all(dim=1)
@@ -198,11 +198,11 @@ def remesh_narrow_band_dc(
         t2 = torch.where(d == 1, q[:, s2_p], q[:, s2_n])
         # Choose split based on normal alignment
         n1_a = torch.cross(mesh_vertices[t1[:,1].long()]-mesh_vertices[t1[:,0].long()], mesh_vertices[t1[:,2].long()]-mesh_vertices[t1[:,0].long()])
-        n1_b = torch.cross(mesh_vertices[t1[:,4].long()]-mesh_vertices[t1[:,3]].long(), mesh_vertices[t1[:,5].long()]-mesh_vertices[t1[:,3]].long())
+        n1_b = torch.cross(mesh_vertices[t1[:,4].long()]-mesh_vertices[t1[:,3].long()], mesh_vertices[t1[:,5].long()]-mesh_vertices[t1[:,3].long()])
         align1 = (n1_a * n1_b).sum(dim=1).abs()
         n2_a = torch.cross(mesh_vertices[t2[:,1].long()]-mesh_vertices[t2[:,0].long()], mesh_vertices[t2[:,2].long()]-mesh_vertices[t2[:,0].long()])
-        n2_b = torch.cross(mesh_vertices[t2[:,4].long()]-mesh_vertices[t2[:,3].long()], mesh_vertices[t2[:,5].long()]-mesh_vertices[t2[:,3]].long())
+        n2_b = torch.cross(mesh_vertices[t2[:,4].long()]-mesh_vertices[t2[:,3].long()], mesh_vertices[t2[:,5].long()]-mesh_vertices[t2[:,3].long()])
         align2 = (n2_a * n2_b).sum(dim=1).abs()
-        mesh_triangles[i*2:end*2] = torch.where((align1 > align2).unsqueeze(1), t1, t2).reshape(-1, 3)
+        mesh_triangles[i*2:end*2] = torch.where((align1 < align2).unsqueeze(1), t1, t2).reshape(-1, 3)
 
     return mesh_vertices, mesh_triangles
