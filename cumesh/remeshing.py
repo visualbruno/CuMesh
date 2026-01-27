@@ -134,22 +134,39 @@ def reconstruct_mesh_dc(
     pbar.close()
 
     # --- 4. Dual Contouring ---
+    if verbose:
+        pbar_dc = tqdm(total=5, desc="Dual Contouring")
     Nvox = coords.shape[0]
     if Nvox == 0:
+        if verbose:
+            pbar_dc.close()
         return torch.zeros((0,3), device=device), torch.zeros((0,3), device=device, dtype=torch.int32)
     
     hashmap_vox = _init_hashmap(resolution, 2 * Nvox, device)
     _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vox, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1), resolution, resolution, resolution)
+    if verbose:
+        pbar_dc.update(1)  # Voxel hashmap
     grid_verts = _C.get_sparse_voxel_grid_active_vertices(*hashmap_vox, coords.contiguous(), resolution, resolution, resolution)
+    if verbose:
+        pbar_dc.update(1)  # Grid vertices
     pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
     dist_vert, _ = chunked_udf(bvh, pts_vert)
+    if verbose:
+        pbar_dc.update(1)  # UDF computation
     hashmap_vert = _init_hashmap(resolution + 1, 2 * grid_verts.shape[0], device)
     _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vert, torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1), resolution+1, resolution+1, resolution+1)
+    if verbose:
+        pbar_dc.update(1)  # Vertex hashmap
     dual_verts, intersected = _C.simple_dual_contour(*hashmap_vert, coords, dist_vert - eps, resolution+1, resolution+1, resolution+1)
+    if verbose:
+        pbar_dc.update(1)  # Dual contour
+        pbar_dc.close()
 
     # --- 5. Topology ---
     quad_list, dir_list, chunk_size = [], [], 524288
     non_zero = torch.nonzero(intersected)
+    num_chunks = (non_zero.shape[0] + chunk_size - 1) // chunk_size
+    pbar_topo = tqdm(total=num_chunks, desc="Building Topology", disable=not verbose)
     for i in range(0, non_zero.shape[0], chunk_size):
         chunk = non_zero[i:i+chunk_size]
         v_idx, a_idx = chunk[:, 0], chunk[:, 1]
@@ -160,6 +177,8 @@ def reconstruct_mesh_dc(
         if mask.any():
             quad_list.append(lookup[mask])
             dir_list.append(intersected[v_idx[mask], a_idx[mask]])
+        pbar_topo.update(1)
+    pbar_topo.close()
 
     if not quad_list: 
         return torch.zeros((0,3), device=device), torch.zeros((0,3), device=device, dtype=torch.int32)
@@ -180,6 +199,8 @@ def reconstruct_mesh_dc(
 
     # --- 6. Triangulation with correct normals ---
     mesh_triangles = torch.empty((quad_indices.shape[0] * 2, 3), dtype=torch.int32, device=device)
+    num_tri_chunks = (quad_indices.shape[0] + chunk_size - 1) // chunk_size
+    pbar_tri = tqdm(total=num_tri_chunks, desc="Triangulation", disable=not verbose)
     for i in range(0, quad_indices.shape[0], chunk_size):
         end = min(i + chunk_size, quad_indices.shape[0])
         q, d = quad_indices[i:end], intersected_dir[i:end].unsqueeze(1)
@@ -193,15 +214,21 @@ def reconstruct_mesh_dc(
         n2_b = torch.cross(mesh_vertices[t2[:,4].long()]-mesh_vertices[t2[:,3].long()], mesh_vertices[t2[:,5].long()]-mesh_vertices[t2[:,3].long()])
         align2 = (n2_a * n2_b).sum(dim=1).abs()
         mesh_triangles[i*2:end*2] = torch.where((align1 < align2).unsqueeze(1), t1, t2).reshape(-1, 3)
+        pbar_tri.update(1)
+    pbar_tri.close()
 
     # --- 7. Remove inner layer ---
     # Use ray stabbing to determine if face centers are inside or outside the original mesh
     # Outer layer: face centers are OUTSIDE original mesh (positive signed distance)
     # Inner layer: face centers are INSIDE original mesh (negative signed distance)
+    if verbose:
+        pbar_layer = tqdm(total=3, desc="Removing Inner Layer")
     v0 = mesh_vertices[mesh_triangles[:, 0].long()]
     v1 = mesh_vertices[mesh_triangles[:, 1].long()]
     v2 = mesh_vertices[mesh_triangles[:, 2].long()]
     face_centers = (v0 + v1 + v2) / 3
+    if verbose:
+        pbar_layer.update(1)  # Face centers computed
     
     # Use ray stabbing mode for signed distance (works even with broken normals)
     def chunked_sdf_raystab(bvh_ptr, pts, chunk_size=524288):
@@ -214,12 +241,17 @@ def reconstruct_mesh_dc(
         return distances
     
     signed_dist = chunked_sdf_raystab(bvh, face_centers)
+    if verbose:
+        pbar_layer.update(1)  # Signed distance computed
     
     # Keep only faces where center is OUTSIDE original mesh (positive signed distance)
     # or very close to surface (within eps tolerance)
     is_outer = signed_dist >= -eps * 0.1
     
     mesh_triangles = mesh_triangles[is_outer]
+    if verbose:
+        pbar_layer.update(1)  # Filtering done
+        pbar_layer.close()
     
     # Re-index vertices to remove unused ones
     used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
