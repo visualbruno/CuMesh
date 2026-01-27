@@ -33,6 +33,205 @@ def get_morton_order(coords: torch.Tensor):
     return torch.argsort(morton)
 
 
+def reconstruct_mesh_dc(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    resolution: int = 256,
+    band: float = 1,
+    verbose: bool = False,
+    bvh = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Reconstruct a mesh using dual contouring to obtain correct face normals.
+    
+    This function uses a voxel-based approach similar to remesh_narrow_band_dc,
+    but without smoothing or projection steps. The resulting mesh will have
+    consistent outward-facing normals determined by the SDF sign transitions.
+    
+    Note: This reconstructs the mesh geometry, so there will be slight differences
+    from the original due to voxelization. For higher fidelity, use higher resolution.
+    
+    Args:
+        vertices: [V, 3] tensor of vertex positions
+        faces: [F, 3] tensor of face indices
+        resolution: Voxel grid resolution (higher = more detail, more memory)
+        band: Narrow band width in voxel units (default 1)
+        verbose: Print progress information
+        bvh: Optional pre-built cuBVH
+        
+    Returns:
+        Tuple of (new_vertices, new_faces) with correct normals
+    """
+    device = vertices.device
+    
+    # Compute bounding box and scale
+    bbox_min = vertices.min(dim=0).values
+    bbox_max = vertices.max(dim=0).values
+    center = (bbox_min + bbox_max) / 2
+    scale = (bbox_max - bbox_min).max().item() * 1.1  # 10% padding
+    
+    # --- 1. Constants ---
+    edge_neighbor_voxel_offset = torch.tensor([
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+    ], dtype=torch.int32, device=device).unsqueeze(0)
+
+    s1_n, s1_p = torch.tensor([0, 1, 2, 0, 2, 3], device=device), torch.tensor([0, 2, 1, 0, 3, 2], device=device)
+    s2_n, s2_p = torch.tensor([0, 1, 3, 3, 1, 2], device=device), torch.tensor([0, 3, 1, 3, 2, 1], device=device)
+    OFFSETS = torch.tensor([[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]], dtype=torch.int32, device=device)
+
+    # --- 2. Helpers ---
+    def get_morton_indices(coords: torch.Tensor):
+        if coords.shape[0] > 10_000_000:
+            return torch.arange(coords.shape[0], device=device)
+        c = coords.long()
+        def spread(x):
+            x = (x | (x << 16)) & 0x030000FF0000FF
+            x = (x | (x << 8))  & 0x0300F00F00F00F
+            x = (x | (x << 4))  & 0x030C30C30C30C3
+            x = (x | (x << 2))  & 0x09249249249249
+            return x
+        morton = (spread(c[:, 0]) << 2) | (spread(c[:, 1]) << 1) | spread(c[:, 2])
+        return torch.argsort(morton)
+
+    def chunked_udf(bvh_ptr, pts, chunk_size=524288):
+        N = pts.shape[0]
+        distances = torch.empty(N, dtype=torch.float32, device=device)
+        face_ids = torch.empty(N, dtype=torch.int64, device=device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d, f, _ = bvh_ptr.unsigned_distance(pts[i:end])
+            distances[i:end], face_ids[i:end] = d, f
+        return distances, face_ids
+
+    # --- 3. Sparse Grid Construction ---
+    if bvh is None: 
+        bvh = cuBVH(vertices, faces)
+    eps = band * scale / resolution
+    base_res = resolution
+    while base_res > 32: base_res //= 2
+    
+    coords = torch.stack(torch.meshgrid(
+        torch.arange(base_res, device=device), 
+        torch.arange(base_res, device=device), 
+        torch.arange(base_res, device=device), 
+        indexing='ij'
+    ), dim=-1).int().reshape(-1, 3)
+    
+    pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_res)).item()) + 1, desc="Sparse Grid", disable=not verbose)
+    while True:
+        pbar.update(1)
+        cell_size = scale / base_res
+        pts = ((coords.float() + 0.5) / base_res - 0.5) * scale + center
+        dist, _ = chunked_udf(bvh, pts)
+        coords = coords[torch.abs(dist - eps) < 0.87 * cell_size]
+        if base_res >= resolution: break
+        base_res *= 2
+        coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        if coords.shape[0] < 8_000_000:
+            coords = coords[get_morton_indices(coords)]
+    pbar.close()
+
+    # --- 4. Dual Contouring ---
+    Nvox = coords.shape[0]
+    if Nvox == 0:
+        return torch.zeros((0,3), device=device), torch.zeros((0,3), device=device, dtype=torch.int32)
+    
+    hashmap_vox = _init_hashmap(resolution, 2 * Nvox, device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vox, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1), resolution, resolution, resolution)
+    grid_verts = _C.get_sparse_voxel_grid_active_vertices(*hashmap_vox, coords.contiguous(), resolution, resolution, resolution)
+    pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
+    dist_vert, _ = chunked_udf(bvh, pts_vert)
+    hashmap_vert = _init_hashmap(resolution + 1, 2 * grid_verts.shape[0], device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vert, torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1), resolution+1, resolution+1, resolution+1)
+    dual_verts, intersected = _C.simple_dual_contour(*hashmap_vert, coords, dist_vert - eps, resolution+1, resolution+1, resolution+1)
+
+    # --- 5. Topology ---
+    quad_list, dir_list, chunk_size = [], [], 524288
+    non_zero = torch.nonzero(intersected)
+    for i in range(0, non_zero.shape[0], chunk_size):
+        chunk = non_zero[i:i+chunk_size]
+        v_idx, a_idx = chunk[:, 0], chunk[:, 1]
+        neighs = coords[v_idx].unsqueeze(1) + edge_neighbor_voxel_offset[0, a_idx]
+        keys = torch.cat([torch.zeros((neighs.shape[0]*4, 1), dtype=torch.int, device=device), neighs.reshape(-1, 3)], dim=1)
+        lookup = _C.hashmap_lookup_3d_cuda(*hashmap_vox, keys, resolution, resolution, resolution).reshape(-1, 4).int()
+        mask = (lookup != 0xffffffff).all(dim=1)
+        if mask.any():
+            quad_list.append(lookup[mask])
+            dir_list.append(intersected[v_idx[mask], a_idx[mask]])
+
+    if not quad_list: 
+        return torch.zeros((0,3), device=device), torch.zeros((0,3), device=device, dtype=torch.int32)
+    
+    quad_indices = torch.cat(quad_list, dim=0)
+    intersected_dir = torch.cat(dir_list, dim=0).int()
+
+    # Re-indexing
+    active_mask = torch.zeros(Nvox, dtype=torch.bool, device=device)
+    active_mask[quad_indices.flatten().long()] = True
+    vert_map = torch.full((Nvox,), -1, dtype=torch.int32, device=device)
+    vert_map[active_mask] = torch.arange(active_mask.sum().item(), dtype=torch.int32, device=device)
+    dual_verts = dual_verts[active_mask]
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        quad_indices[i:end] = vert_map[quad_indices[i:end].long()]
+    mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
+
+    # --- 6. Triangulation with correct normals ---
+    mesh_triangles = torch.empty((quad_indices.shape[0] * 2, 3), dtype=torch.int32, device=device)
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        q, d = quad_indices[i:end], intersected_dir[i:end].unsqueeze(1)
+        t1 = torch.where(d == 1, q[:, s1_p], q[:, s1_n])
+        t2 = torch.where(d == 1, q[:, s2_p], q[:, s2_n])
+        # Choose split based on normal alignment
+        n1_a = torch.cross(mesh_vertices[t1[:,1].long()]-mesh_vertices[t1[:,0].long()], mesh_vertices[t1[:,2].long()]-mesh_vertices[t1[:,0].long()])
+        n1_b = torch.cross(mesh_vertices[t1[:,4].long()]-mesh_vertices[t1[:,3].long()], mesh_vertices[t1[:,5].long()]-mesh_vertices[t1[:,3].long()])
+        align1 = (n1_a * n1_b).sum(dim=1).abs()
+        n2_a = torch.cross(mesh_vertices[t2[:,1].long()]-mesh_vertices[t2[:,0].long()], mesh_vertices[t2[:,2].long()]-mesh_vertices[t2[:,0].long()])
+        n2_b = torch.cross(mesh_vertices[t2[:,4].long()]-mesh_vertices[t2[:,3].long()], mesh_vertices[t2[:,5].long()]-mesh_vertices[t2[:,3].long()])
+        align2 = (n2_a * n2_b).sum(dim=1).abs()
+        mesh_triangles[i*2:end*2] = torch.where((align1 < align2).unsqueeze(1), t1, t2).reshape(-1, 3)
+
+    # --- 7. Remove inner layer ---
+    # Use ray stabbing to determine if face centers are inside or outside the original mesh
+    # Outer layer: face centers are OUTSIDE original mesh (positive signed distance)
+    # Inner layer: face centers are INSIDE original mesh (negative signed distance)
+    v0 = mesh_vertices[mesh_triangles[:, 0].long()]
+    v1 = mesh_vertices[mesh_triangles[:, 1].long()]
+    v2 = mesh_vertices[mesh_triangles[:, 2].long()]
+    face_centers = (v0 + v1 + v2) / 3
+    
+    # Use ray stabbing mode for signed distance (works even with broken normals)
+    def chunked_sdf_raystab(bvh_ptr, pts, chunk_size=524288):
+        N = pts.shape[0]
+        distances = torch.empty(N, dtype=torch.float32, device=device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d, _, _ = bvh_ptr.signed_distance(pts[i:end], mode='raystab')
+            distances[i:end] = d
+        return distances
+    
+    signed_dist = chunked_sdf_raystab(bvh, face_centers)
+    
+    # Keep only faces where center is OUTSIDE original mesh (positive signed distance)
+    # or very close to surface (within eps tolerance)
+    is_outer = signed_dist >= -eps * 0.1
+    
+    mesh_triangles = mesh_triangles[is_outer]
+    
+    # Re-index vertices to remove unused ones
+    used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
+    used_verts[mesh_triangles.flatten().long()] = True
+    new_vert_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
+    new_vert_idx[used_verts] = torch.arange(used_verts.sum().item(), dtype=torch.int32, device=device)
+    mesh_vertices = mesh_vertices[used_verts]
+    mesh_triangles = new_vert_idx[mesh_triangles.long()]
+
+    return mesh_vertices, mesh_triangles
+
+
 def remesh_narrow_band_dc(
     vertices: torch.Tensor,
     faces: torch.Tensor,
