@@ -108,7 +108,7 @@ def reconstruct_mesh_dc(
     # --- 3. Sparse Grid Construction ---
     if bvh is None: 
         bvh = cuBVH(vertices.detach().clone(), faces.detach().clone())
-    eps = band * scale / resolution
+    eps = max(band * scale / resolution, scale / resolution * 0.5) 
     base_res = resolution
     while base_res > 32: base_res //= 2
     
@@ -125,7 +125,7 @@ def reconstruct_mesh_dc(
         cell_size = scale / base_res
         pts = ((coords.float() + 0.5) / base_res - 0.5) * scale + center
         dist, _ = chunked_udf(bvh, pts)
-        coords = coords[torch.abs(dist - eps) < 0.87 * cell_size]
+        coords = coords[torch.abs(dist - eps) < 0.87 * cell_size + eps * 0.5]
         if base_res >= resolution: break
         base_res *= 2
         # Chunked voxel expansion to avoid OOM on large grids
@@ -181,7 +181,7 @@ def reconstruct_mesh_dc(
     dual_verts, intersected = _C.simple_dual_contour(*hashmap_vert, coords, dist_vert - eps, resolution+1, resolution+1, resolution+1)
     if verbose:
         pbar_dc.update(1)  # Dual contour
-        pbar_dc.close()
+        pbar_dc.close()     
 
     # --- 5. Topology ---
     quad_list, dir_list, chunk_size = [], [], 524288
@@ -294,7 +294,8 @@ def remesh_narrow_band_dc(
     band: float = 1,
     project_back: float = 0,
     verbose: bool = False,
-    bvh = None
+    bvh = None,
+    remove_inner_faces: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = vertices.device
     
@@ -338,7 +339,7 @@ def remesh_narrow_band_dc(
 
     # --- 3. Sparse Grid Construction ---
     if bvh is None: bvh = cuBVH(vertices.detach().clone(), faces.detach().clone())
-    eps = band * scale / resolution
+    eps = max(band * scale / resolution, scale / resolution * 0.5)
     base_res = resolution
     while base_res > 32: base_res //= 2
     
@@ -350,7 +351,7 @@ def remesh_narrow_band_dc(
         cell_size = scale / base_res
         pts = ((coords.float() + 0.5) / base_res - 0.5) * scale + center
         dist, _, _ = chunked_udf(bvh, pts)
-        coords = coords[torch.abs(dist - eps) < 0.87 * cell_size]
+        coords = coords[torch.abs(dist - eps) < 0.87 * cell_size + eps * 0.5]
         if base_res >= resolution: break
         base_res *= 2
         # Chunked voxel expansion to avoid OOM on large grids
@@ -477,5 +478,50 @@ def remesh_narrow_band_dc(
         n2_b = torch.cross(mesh_vertices[t2[:,4].long()]-mesh_vertices[t2[:,3].long()], mesh_vertices[t2[:,5].long()]-mesh_vertices[t2[:,3].long()])
         align2 = (n2_a * n2_b).sum(dim=1).abs()
         mesh_triangles[i*2:end*2] = torch.where((align1 < align2).unsqueeze(1), t1, t2).reshape(-1, 3)
+
+    if remove_inner_faces:
+        # --- 8. Remove inner layer ---
+        # Use ray stabbing to determine if face centers are inside or outside the original mesh
+        # Outer layer: face centers are OUTSIDE original mesh (positive signed distance)
+        # Inner layer: face centers are INSIDE original mesh (negative signed distance)
+        if verbose:
+            pbar_layer = tqdm(total=3, desc="Removing Inner Layer")
+        v0 = mesh_vertices[mesh_triangles[:, 0].long()]
+        v1 = mesh_vertices[mesh_triangles[:, 1].long()]
+        v2 = mesh_vertices[mesh_triangles[:, 2].long()]
+        face_centers = (v0 + v1 + v2) / 3
+        if verbose:
+            pbar_layer.update(1)  # Face centers computed
+        
+        # Use ray stabbing mode for signed distance (works even with broken normals)
+        def chunked_sdf_raystab(bvh_ptr, pts, chunk_size=524288):
+            N = pts.shape[0]
+            distances = torch.empty(N, dtype=torch.float32, device=device)
+            for i in range(0, N, chunk_size):
+                end = min(i + chunk_size, N)
+                d, _, _ = bvh_ptr.signed_distance(pts[i:end], mode='raystab')
+                distances[i:end] = d
+            return distances
+        
+        signed_dist = chunked_sdf_raystab(bvh, face_centers)
+        if verbose:
+            pbar_layer.update(1)  # Signed distance computed
+        
+        # Keep only faces where center is OUTSIDE original mesh (positive signed distance)
+        # or very close to surface (within eps tolerance)
+        is_outer = signed_dist >= -eps * 0.1
+        
+        mesh_triangles = mesh_triangles[is_outer]
+        if verbose:
+            pbar_layer.update(1)  # Filtering done
+            pbar_layer.close()
+        
+        # Re-index vertices to remove unused ones
+        used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
+        used_verts[mesh_triangles.flatten().long()] = True
+        new_vert_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
+        new_vert_idx[used_verts] = torch.arange(used_verts.sum().item(), dtype=torch.int32, device=device)
+        mesh_vertices = mesh_vertices[used_verts]
+        mesh_triangles = new_vert_idx[mesh_triangles.long()]
 
     return mesh_vertices, mesh_triangles
