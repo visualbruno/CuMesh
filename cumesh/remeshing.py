@@ -107,7 +107,7 @@ def reconstruct_mesh_dc(
 
     # --- 3. Sparse Grid Construction ---
     if bvh is None: 
-        bvh = cuBVH(vertices, faces)
+        bvh = cuBVH(vertices.detach().clone(), faces.detach().clone())
     eps = band * scale / resolution
     base_res = resolution
     while base_res > 32: base_res //= 2
@@ -128,7 +128,28 @@ def reconstruct_mesh_dc(
         coords = coords[torch.abs(dist - eps) < 0.87 * cell_size]
         if base_res >= resolution: break
         base_res *= 2
-        coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        # Chunked voxel expansion to avoid OOM on large grids
+        expand_chunk_size = 250_000  # Process 250K coords at a time
+        if coords.shape[0] <= expand_chunk_size:
+            coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        else:
+            # Process in chunks with progressive deduplication
+            result_coords = None
+            for i in range(0, coords.shape[0], expand_chunk_size):
+                end = min(i + expand_chunk_size, coords.shape[0])
+                chunk = coords[i:end]
+                expanded = (chunk.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+                if result_coords is None:
+                    result_coords = expanded
+                else:
+                    result_coords = torch.cat([result_coords, expanded], dim=0)
+                del expanded
+                # Deduplicate every 4 chunks to keep memory bounded
+                if (i // expand_chunk_size + 1) % 4 == 0 or end >= coords.shape[0]:
+                    result_coords = torch.unique(result_coords, dim=0)
+                    torch.cuda.empty_cache() if device.type == 'cuda' else None
+            coords = result_coords
+            del result_coords
         if coords.shape[0] < 8_000_000:
             coords = coords[get_morton_indices(coords)]
     pbar.close()
@@ -316,7 +337,7 @@ def remesh_narrow_band_dc(
         return distances, face_ids, uvws
 
     # --- 3. Sparse Grid Construction ---
-    if bvh is None: bvh = cuBVH(vertices, faces)
+    if bvh is None: bvh = cuBVH(vertices.detach().clone(), faces.detach().clone())
     eps = band * scale / resolution
     base_res = resolution
     while base_res > 32: base_res //= 2
@@ -332,7 +353,28 @@ def remesh_narrow_band_dc(
         coords = coords[torch.abs(dist - eps) < 0.87 * cell_size]
         if base_res >= resolution: break
         base_res *= 2
-        coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        # Chunked voxel expansion to avoid OOM on large grids
+        expand_chunk_size = 250_000  # Process 250K coords at a time
+        if coords.shape[0] <= expand_chunk_size:
+            coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        else:
+            # Process in chunks with progressive deduplication
+            result_coords = None
+            for i in range(0, coords.shape[0], expand_chunk_size):
+                end = min(i + expand_chunk_size, coords.shape[0])
+                chunk = coords[i:end]
+                expanded = (chunk.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+                if result_coords is None:
+                    result_coords = expanded
+                else:
+                    result_coords = torch.cat([result_coords, expanded], dim=0)
+                del expanded
+                # Deduplicate every 4 chunks to keep memory bounded
+                if (i // expand_chunk_size + 1) % 4 == 0 or end >= coords.shape[0]:
+                    result_coords = torch.unique(result_coords, dim=0)
+                    torch.cuda.empty_cache() if device.type == 'cuda' else None
+            coords = result_coords
+            del result_coords
         # Spatial sorting is most important at the final high-res steps
         if coords.shape[0] < 8_000_000:
             coords = coords[get_morton_indices(coords)]
