@@ -290,24 +290,15 @@ def reconstruct_mesh_dc(
     # or very close to surface (within eps tolerance)
     is_outer = signed_dist >= -eps * 0.1
     
-    print('Filtering (please wait) ...')
-    # Chunked filtering to reduce memory pressure for large meshes
-    filter_chunk_size = 524288
-    filtered_chunks = []
-    num_filter_chunks = (mesh_triangles.shape[0] + filter_chunk_size - 1) // filter_chunk_size
-    pbar_filter = tqdm(total=num_filter_chunks, desc="Filtering Triangles", disable=not verbose)
-    for i in range(0, mesh_triangles.shape[0], filter_chunk_size):
-        end = min(i + filter_chunk_size, mesh_triangles.shape[0])
-        chunk_mask = is_outer[i:end]
-        if chunk_mask.any():
-            filtered_chunks.append(mesh_triangles[i:end][chunk_mask])
-        pbar_filter.update(1)
-    pbar_filter.close()
-    
-    if filtered_chunks:
-        mesh_triangles = torch.cat(filtered_chunks, dim=0)
+    print('Filtering triangles...')
+    # Use integer indexing instead of boolean indexing - much faster for large tensors
+    # torch.nonzero finds the indices where is_outer is True, then we use integer indexing
+    outer_indices = torch.nonzero(is_outer, as_tuple=False).squeeze(1)
+    if outer_indices.numel() > 0:
+        mesh_triangles = mesh_triangles[outer_indices]
     else:
         mesh_triangles = torch.zeros((0, 3), dtype=torch.int32, device=device)
+    print(f'Kept {outer_indices.numel()} outer faces out of {is_outer.numel()} total faces')
     #if verbose:
     #    pbar_layer.update(1)  # Filtering done
     #    pbar_layer.close()
@@ -591,24 +582,15 @@ def remesh_narrow_band_dc(
         # or very close to surface (within eps tolerance)
         is_outer = signed_dist >= -eps * 0.1
         
-        print('Filtering (please wait) ...')
-        # Chunked filtering to reduce memory pressure for large meshes
-        filter_chunk_size = 524288
-        filtered_chunks = []
-        num_filter_chunks = (mesh_triangles.shape[0] + filter_chunk_size - 1) // filter_chunk_size
-        pbar_filter = tqdm(total=num_filter_chunks, desc="Filtering Triangles", disable=not verbose)
-        for i in range(0, mesh_triangles.shape[0], filter_chunk_size):
-            end = min(i + filter_chunk_size, mesh_triangles.shape[0])
-            chunk_mask = is_outer[i:end]
-            if chunk_mask.any():
-                filtered_chunks.append(mesh_triangles[i:end][chunk_mask])
-            pbar_filter.update(1)
-        pbar_filter.close()
-        
-        if filtered_chunks:
-            mesh_triangles = torch.cat(filtered_chunks, dim=0)
+        print('Filtering triangles...')
+        # Use integer indexing instead of boolean indexing - much faster for large tensors
+        # torch.nonzero finds the indices where is_outer is True, then we use integer indexing
+        outer_indices = torch.nonzero(is_outer, as_tuple=False).squeeze(1)
+        if outer_indices.numel() > 0:
+            mesh_triangles = mesh_triangles[outer_indices]
         else:
             mesh_triangles = torch.zeros((0, 3), dtype=torch.int32, device=device)
+        print(f'Kept {outer_indices.numel()} outer faces out of {is_outer.numel()} total faces')
         #if verbose:
         #    pbar_layer.update(1)  # Filtering done
         #    pbar_layer.close()
