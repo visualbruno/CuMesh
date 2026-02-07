@@ -242,17 +242,37 @@ def reconstruct_mesh_dc(
     # Use ray stabbing to determine if face centers are inside or outside the original mesh
     # Outer layer: face centers are OUTSIDE original mesh (positive signed distance)
     # Inner layer: face centers are INSIDE original mesh (negative signed distance)
-    if verbose:
-        pbar_layer = tqdm(total=3, desc="Removing Inner Layer")
-    v0 = mesh_vertices[mesh_triangles[:, 0].long()]
-    v1 = mesh_vertices[mesh_triangles[:, 1].long()]
-    v2 = mesh_vertices[mesh_triangles[:, 2].long()]
-    face_centers = (v0 + v1 + v2) / 3
-    if verbose:
-        pbar_layer.update(1)  # Face centers computed
+    print('Removing Inner Layer ...')
+    # --- 8. Remove inner layer ---
+    # Use ray stabbing to determine if face centers are inside or outside the original mesh
+    # Outer layer: face centers are OUTSIDE original mesh (positive signed distance)
+    # Inner layer: face centers are INSIDE original mesh (negative signed distance)
+    face_centers = torch.empty((mesh_triangles.shape[0], 3), dtype=torch.float32, device=device)
+    num_chunks = (mesh_triangles.shape[0] + chunk_size - 1) // chunk_size
+    pbar_centers = tqdm(total=num_chunks, desc="Computing Face Centers", disable=not verbose)
+    for i in range(0, mesh_triangles.shape[0], chunk_size):
+        end = min(i + chunk_size, mesh_triangles.shape[0])
+        tri_chunk = mesh_triangles[i:end].long()
+        # Direct calculation - more memory efficient
+        face_centers[i:end] = (
+            mesh_vertices[tri_chunk[:, 0]] + 
+            mesh_vertices[tri_chunk[:, 1]] + 
+            mesh_vertices[tri_chunk[:, 2]]
+        ) / 3
+        pbar_centers.update(1)
+    pbar_centers.close()
+
+    #if verbose:
+    #    pbar_layer = tqdm(total=3, desc="Removing Inner Layer")
+    #v0 = mesh_vertices[mesh_triangles[:, 0].long()]
+    #v1 = mesh_vertices[mesh_triangles[:, 1].long()]
+    #v2 = mesh_vertices[mesh_triangles[:, 2].long()]
+    #face_centers = (v0 + v1 + v2) / 3
+    #if verbose:
+    #    pbar_layer.update(1)  # Face centers computed
     
     # Use ray stabbing mode for signed distance (works even with broken normals)
-    def chunked_sdf_raystab(bvh_ptr, pts, chunk_size=524288):
+    def chunked_sdf_raystab(bvh_ptr, pts):
         N = pts.shape[0]
         distances = torch.empty(N, dtype=torch.float32, device=device)
         for i in range(0, N, chunk_size):
@@ -261,26 +281,68 @@ def reconstruct_mesh_dc(
             distances[i:end] = d
         return distances
     
+    print('Signed Distance Computing ...')
     signed_dist = chunked_sdf_raystab(bvh, face_centers)
-    if verbose:
-        pbar_layer.update(1)  # Signed distance computed
+    #if verbose:
+    #    pbar_layer.update(1)  # Signed distance computed
     
     # Keep only faces where center is OUTSIDE original mesh (positive signed distance)
     # or very close to surface (within eps tolerance)
     is_outer = signed_dist >= -eps * 0.1
     
-    mesh_triangles = mesh_triangles[is_outer]
-    if verbose:
-        pbar_layer.update(1)  # Filtering done
-        pbar_layer.close()
+    print('Filtering (please wait) ...')
+    # Chunked filtering to reduce memory pressure for large meshes
+    filter_chunk_size = 524288
+    filtered_chunks = []
+    num_filter_chunks = (mesh_triangles.shape[0] + filter_chunk_size - 1) // filter_chunk_size
+    pbar_filter = tqdm(total=num_filter_chunks, desc="Filtering Triangles", disable=not verbose)
+    for i in range(0, mesh_triangles.shape[0], filter_chunk_size):
+        end = min(i + filter_chunk_size, mesh_triangles.shape[0])
+        chunk_mask = is_outer[i:end]
+        if chunk_mask.any():
+            filtered_chunks.append(mesh_triangles[i:end][chunk_mask])
+        pbar_filter.update(1)
+    pbar_filter.close()
     
-    # Re-index vertices to remove unused ones
+    if filtered_chunks:
+        mesh_triangles = torch.cat(filtered_chunks, dim=0)
+    else:
+        mesh_triangles = torch.zeros((0, 3), dtype=torch.int32, device=device)
+    #if verbose:
+    #    pbar_layer.update(1)  # Filtering done
+    #    pbar_layer.close()
+    
+    # Re-index vertices to remove unused ones (chunked for performance)
+    print('Re-indexing vertices ...')
     used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
-    used_verts[mesh_triangles.flatten().long()] = True
+    
+    # Mark used vertices in chunks to avoid large flatten() operation
+    reindex_chunk_size = 524288
+    num_reindex_chunks = (mesh_triangles.shape[0] + reindex_chunk_size - 1) // reindex_chunk_size
+    pbar_reindex = tqdm(total=num_reindex_chunks, desc="Marking Used Vertices", disable=not verbose)
+    for i in range(0, mesh_triangles.shape[0], reindex_chunk_size):
+        end = min(i + reindex_chunk_size, mesh_triangles.shape[0])
+        tri_chunk = mesh_triangles[i:end].long()
+        # Mark vertices used in this chunk (all 3 vertices per triangle)
+        used_verts[tri_chunk[:, 0]] = True
+        used_verts[tri_chunk[:, 1]] = True
+        used_verts[tri_chunk[:, 2]] = True
+        pbar_reindex.update(1)
+    pbar_reindex.close()
+    
+    # Create compact vertex mapping
     new_vert_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
     new_vert_idx[used_verts] = torch.arange(used_verts.sum().item(), dtype=torch.int32, device=device)
     mesh_vertices = mesh_vertices[used_verts]
-    mesh_triangles = new_vert_idx[mesh_triangles.long()]
+    
+    # Remap triangle indices in chunks
+    pbar_remap = tqdm(total=num_reindex_chunks, desc="Remapping Triangle Indices", disable=not verbose)
+    for i in range(0, mesh_triangles.shape[0], reindex_chunk_size):
+        end = min(i + reindex_chunk_size, mesh_triangles.shape[0])
+        mesh_triangles[i:end] = new_vert_idx[mesh_triangles[i:end].long()]
+        pbar_remap.update(1)
+    pbar_remap.close()
+    print('Inner Layer removed')
 
     return mesh_vertices, mesh_triangles
 
@@ -480,21 +542,38 @@ def remesh_narrow_band_dc(
         mesh_triangles[i*2:end*2] = torch.where((align1 < align2).unsqueeze(1), t1, t2).reshape(-1, 3)
 
     if remove_inner_faces:
+        print('Removing Inner Layer ...')
         # --- 8. Remove inner layer ---
         # Use ray stabbing to determine if face centers are inside or outside the original mesh
         # Outer layer: face centers are OUTSIDE original mesh (positive signed distance)
         # Inner layer: face centers are INSIDE original mesh (negative signed distance)
-        if verbose:
-            pbar_layer = tqdm(total=3, desc="Removing Inner Layer")
-        v0 = mesh_vertices[mesh_triangles[:, 0].long()]
-        v1 = mesh_vertices[mesh_triangles[:, 1].long()]
-        v2 = mesh_vertices[mesh_triangles[:, 2].long()]
-        face_centers = (v0 + v1 + v2) / 3
-        if verbose:
-            pbar_layer.update(1)  # Face centers computed
+        chunk_size = 524288
+        face_centers = torch.empty((mesh_triangles.shape[0], 3), dtype=torch.float32, device=device)
+        num_chunks = (mesh_triangles.shape[0] + chunk_size - 1) // chunk_size
+        pbar_centers = tqdm(total=num_chunks, desc="Computing Face Centers", disable=not verbose)
+        for i in range(0, mesh_triangles.shape[0], chunk_size):
+            end = min(i + chunk_size, mesh_triangles.shape[0])
+            tri_chunk = mesh_triangles[i:end].long()
+            # Direct calculation - more memory efficient
+            face_centers[i:end] = (
+                mesh_vertices[tri_chunk[:, 0]] + 
+                mesh_vertices[tri_chunk[:, 1]] + 
+                mesh_vertices[tri_chunk[:, 2]]
+            ) / 3
+            pbar_centers.update(1)
+        pbar_centers.close()
+
+        #if verbose:
+        #    pbar_layer = tqdm(total=3, desc="Removing Inner Layer")
+        #v0 = mesh_vertices[mesh_triangles[:, 0].long()]
+        #v1 = mesh_vertices[mesh_triangles[:, 1].long()]
+        #v2 = mesh_vertices[mesh_triangles[:, 2].long()]
+        #face_centers = (v0 + v1 + v2) / 3
+        #if verbose:
+        #    pbar_layer.update(1)  # Face centers computed
         
         # Use ray stabbing mode for signed distance (works even with broken normals)
-        def chunked_sdf_raystab(bvh_ptr, pts, chunk_size=524288):
+        def chunked_sdf_raystab(bvh_ptr, pts):
             N = pts.shape[0]
             distances = torch.empty(N, dtype=torch.float32, device=device)
             for i in range(0, N, chunk_size):
@@ -503,25 +582,67 @@ def remesh_narrow_band_dc(
                 distances[i:end] = d
             return distances
         
+        print('Signed Distance Computing ...')
         signed_dist = chunked_sdf_raystab(bvh, face_centers)
-        if verbose:
-            pbar_layer.update(1)  # Signed distance computed
+        #if verbose:
+        #    pbar_layer.update(1)  # Signed distance computed
         
         # Keep only faces where center is OUTSIDE original mesh (positive signed distance)
         # or very close to surface (within eps tolerance)
         is_outer = signed_dist >= -eps * 0.1
         
-        mesh_triangles = mesh_triangles[is_outer]
-        if verbose:
-            pbar_layer.update(1)  # Filtering done
-            pbar_layer.close()
+        print('Filtering (please wait) ...')
+        # Chunked filtering to reduce memory pressure for large meshes
+        filter_chunk_size = 524288
+        filtered_chunks = []
+        num_filter_chunks = (mesh_triangles.shape[0] + filter_chunk_size - 1) // filter_chunk_size
+        pbar_filter = tqdm(total=num_filter_chunks, desc="Filtering Triangles", disable=not verbose)
+        for i in range(0, mesh_triangles.shape[0], filter_chunk_size):
+            end = min(i + filter_chunk_size, mesh_triangles.shape[0])
+            chunk_mask = is_outer[i:end]
+            if chunk_mask.any():
+                filtered_chunks.append(mesh_triangles[i:end][chunk_mask])
+            pbar_filter.update(1)
+        pbar_filter.close()
         
-        # Re-index vertices to remove unused ones
+        if filtered_chunks:
+            mesh_triangles = torch.cat(filtered_chunks, dim=0)
+        else:
+            mesh_triangles = torch.zeros((0, 3), dtype=torch.int32, device=device)
+        #if verbose:
+        #    pbar_layer.update(1)  # Filtering done
+        #    pbar_layer.close()
+        
+        # Re-index vertices to remove unused ones (chunked for performance)
+        print('Re-indexing vertices ...')
         used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
-        used_verts[mesh_triangles.flatten().long()] = True
+        
+        # Mark used vertices in chunks to avoid large flatten() operation
+        reindex_chunk_size = 524288
+        num_reindex_chunks = (mesh_triangles.shape[0] + reindex_chunk_size - 1) // reindex_chunk_size
+        pbar_reindex = tqdm(total=num_reindex_chunks, desc="Marking Used Vertices", disable=not verbose)
+        for i in range(0, mesh_triangles.shape[0], reindex_chunk_size):
+            end = min(i + reindex_chunk_size, mesh_triangles.shape[0])
+            tri_chunk = mesh_triangles[i:end].long()
+            # Mark vertices used in this chunk (all 3 vertices per triangle)
+            used_verts[tri_chunk[:, 0]] = True
+            used_verts[tri_chunk[:, 1]] = True
+            used_verts[tri_chunk[:, 2]] = True
+            pbar_reindex.update(1)
+        pbar_reindex.close()
+        
+        # Create compact vertex mapping
         new_vert_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
         new_vert_idx[used_verts] = torch.arange(used_verts.sum().item(), dtype=torch.int32, device=device)
         mesh_vertices = mesh_vertices[used_verts]
-        mesh_triangles = new_vert_idx[mesh_triangles.long()]
+        
+        # Remap triangle indices in chunks
+        pbar_remap = tqdm(total=num_reindex_chunks, desc="Remapping Triangle Indices", disable=not verbose)
+        for i in range(0, mesh_triangles.shape[0], reindex_chunk_size):
+            end = min(i + reindex_chunk_size, mesh_triangles.shape[0])
+            mesh_triangles[i:end] = new_vert_idx[mesh_triangles[i:end].long()]
+            pbar_remap.update(1)
+        pbar_remap.close()
+        print('Inner Layer removed')
 
     return mesh_vertices, mesh_triangles
