@@ -290,15 +290,14 @@ def reconstruct_mesh_dc(
     # or very close to surface (within eps tolerance)
     is_outer = signed_dist >= -eps * 0.1
     
-    print('Filtering triangles...')
+    print(f"Filtering {mesh_triangles.shape[0]} triangles...")
     # Use integer indexing instead of boolean indexing - much faster for large tensors
     # torch.nonzero finds the indices where is_outer is True, then we use integer indexing
-    outer_indices = torch.nonzero(is_outer, as_tuple=False).squeeze(1)
-    if outer_indices.numel() > 0:
-        mesh_triangles = mesh_triangles[outer_indices]
-    else:
-        mesh_triangles = torch.zeros((0, 3), dtype=torch.int32, device=device)
-    print(f'Kept {outer_indices.numel()} outer faces out of {is_outer.numel()} total faces')
+    mesh_triangles_cpu = mesh_triangles.cpu()
+    is_outer_cpu = is_outer.cpu()
+
+    mesh_triangles_cpu = mesh_triangles_cpu[is_outer_cpu]
+    mesh_triangles = mesh_triangles_cpu.to(device)
     #if verbose:
     #    pbar_layer.update(1)  # Filtering done
     #    pbar_layer.close()
@@ -582,15 +581,15 @@ def remesh_narrow_band_dc(
         # or very close to surface (within eps tolerance)
         is_outer = signed_dist >= -eps * 0.1
         
-        print('Filtering triangles...')
+        print(f"Filtering {mesh_triangles.shape[0]} triangles...")
         # Use integer indexing instead of boolean indexing - much faster for large tensors
         # torch.nonzero finds the indices where is_outer is True, then we use integer indexing
-        outer_indices = torch.nonzero(is_outer, as_tuple=False).squeeze(1)
-        if outer_indices.numel() > 0:
-            mesh_triangles = mesh_triangles[outer_indices]
-        else:
-            mesh_triangles = torch.zeros((0, 3), dtype=torch.int32, device=device)
-        print(f'Kept {outer_indices.numel()} outer faces out of {is_outer.numel()} total faces')
+        mesh_triangles_cpu = mesh_triangles.cpu()
+        is_outer_cpu = is_outer.cpu()
+
+        mesh_triangles_cpu = mesh_triangles_cpu[is_outer_cpu]
+        mesh_triangles = mesh_triangles_cpu.to(device)
+        
         #if verbose:
         #    pbar_layer.update(1)  # Filtering done
         #    pbar_layer.close()
