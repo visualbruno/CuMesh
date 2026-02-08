@@ -672,3 +672,557 @@ def remesh_narrow_band_dc(
         print('Inner Layer removed')
 
     return mesh_vertices, mesh_triangles
+    
+def remesh_narrow_band_dc_quad(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    center: torch.Tensor,
+    scale: float,
+    resolution: int,
+    band: float = 1,
+    project_back: float = 0,
+    verbose: bool = False,
+    bvh=None,
+    remove_inner_faces: bool = True,  # now quad-level
+):
+    device = vertices.device
+
+    # -------------------------------------------------------------------------
+    # 1. Constants
+    # -------------------------------------------------------------------------
+    edge_neighbor_voxel_offset = torch.tensor([
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+    ], dtype=torch.int32, device=device).unsqueeze(0)
+
+    s1_n = torch.tensor([0, 1, 2, 0, 2, 3], device=device)
+    s1_p = torch.tensor([0, 2, 1, 0, 3, 2], device=device)
+    s2_n = torch.tensor([0, 1, 3, 3, 1, 2], device=device)
+    s2_p = torch.tensor([0, 3, 1, 3, 2, 1], device=device)
+
+    OFFSETS = torch.tensor(
+        [[0,0,0],[1,0,0],[0,1,0],[1,1,0],
+         [0,0,1],[1,0,1],[0,1,1],[1,1,1]],
+        dtype=torch.int32,
+        device=device
+    )
+
+    chunk_size = 524_288
+
+    # -------------------------------------------------------------------------
+    # 2. Helpers
+    # -------------------------------------------------------------------------
+    def chunked_udf(bvh_ptr, pts):
+        N = pts.shape[0]
+        dist = torch.empty(N, dtype=torch.float32, device=device)
+        face = torch.empty(N, dtype=torch.int64, device=device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d, f, _ = bvh_ptr.unsigned_distance(pts[i:end])
+            dist[i:end] = d
+            face[i:end] = f
+        return dist, face
+
+    def chunked_sdf_raystab(bvh_ptr, pts):
+        N = pts.shape[0]
+        dist = torch.empty(N, dtype=torch.float32, device=device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d, _, _ = bvh_ptr.signed_distance(pts[i:end], mode="raystab")
+            dist[i:end] = d
+        return dist
+
+    # -------------------------------------------------------------------------
+    # 3. Sparse Grid Construction
+    # -------------------------------------------------------------------------
+    if bvh is None:
+        bvh = cuBVH(vertices.detach().clone(), faces.detach().clone())
+
+    eps = max(band * scale / resolution, scale / resolution * 0.5)
+
+    base_res = resolution
+    while base_res > 32:
+        base_res //= 2
+
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(base_res, device=device),
+            torch.arange(base_res, device=device),
+            torch.arange(base_res, device=device),
+            indexing="ij"
+        ),
+        dim=-1
+    ).int().reshape(-1, 3)
+
+    pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_res)).item()) + 1, desc="Sparse Grid", disable=not verbose)
+    while True:
+        pbar.update(1)
+        cell = scale / base_res
+        pts = ((coords.float() + 0.5) / base_res - 0.5) * scale + center
+        dist, _ = chunked_udf(bvh, pts)
+        coords = coords[torch.abs(dist - eps) < 0.87 * cell + eps * 0.5]
+
+        if base_res >= resolution:
+            break
+
+        base_res *= 2
+        coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        coords = torch.unique(coords, dim=0)
+    pbar.close()
+    
+    # -------------------------------------------------------------------------
+    # 4. Dual Contouring
+    # -------------------------------------------------------------------------
+    print('Dual Contouring ...')
+    Nvox = coords.shape[0]
+
+    hashmap_vox = _init_hashmap(resolution, 2 * Nvox, device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap_vox,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1),
+        resolution, resolution, resolution
+    )
+
+    grid_verts = _C.get_sparse_voxel_grid_active_vertices(
+        *hashmap_vox, coords.contiguous(),
+        resolution, resolution, resolution
+    )
+
+    pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
+    dist_vert, _ = chunked_udf(bvh, pts_vert)
+
+    hashmap_vert = _init_hashmap(resolution + 1, 2 * grid_verts.shape[0], device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap_vert,
+        torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1),
+        resolution + 1, resolution + 1, resolution + 1
+    )
+
+    dual_verts, intersected = _C.simple_dual_contour(
+        *hashmap_vert,
+        coords,
+        dist_vert - eps,
+        resolution + 1, resolution + 1, resolution + 1
+    )
+
+    # -------------------------------------------------------------------------
+    # 5. Topology (quads)
+    # -------------------------------------------------------------------------
+    print('Quad Topology ...')
+    quad_list, dir_list = [], []
+    nz = torch.nonzero(intersected)
+
+    for i in range(0, nz.shape[0], chunk_size):
+        c = nz[i:i + chunk_size]
+        v_idx, a_idx = c[:, 0], c[:, 1]
+        neigh = coords[v_idx].unsqueeze(1) + edge_neighbor_voxel_offset[0, a_idx]
+        keys = torch.cat(
+            [torch.zeros((neigh.shape[0] * 4, 1), dtype=torch.int32, device=device),
+             neigh.reshape(-1, 3)],
+            dim=1
+        )
+        lookup = _C.hashmap_lookup_3d_cuda(
+            *hashmap_vox, keys,
+            resolution, resolution, resolution
+        ).reshape(-1, 4).int()
+
+        mask = (lookup != 0xffffffff).all(dim=1)
+        if mask.any():
+            quad_list.append(lookup[mask])
+            dir_list.append(intersected[v_idx[mask], a_idx[mask]])
+
+    if not quad_list:
+        return (
+            torch.zeros((0, 3), device=device),
+            torch.zeros((0, 3), device=device, dtype=torch.int32),
+        )
+
+    quad_indices = torch.cat(quad_list, dim=0)
+    intersected_dir = torch.cat(dir_list, dim=0).int()
+
+    # -------------------------------------------------------------------------
+    # 6. Re-index vertices
+    # -------------------------------------------------------------------------
+    print('Re-indexing vertices ...')
+    active = torch.zeros(Nvox, dtype=torch.bool, device=device)
+    active[quad_indices.flatten()] = True
+
+    vert_map = torch.full((Nvox,), -1, dtype=torch.int32, device=device)
+    vert_map[active] = torch.arange(
+        active.sum(),
+        dtype=torch.int32,
+        device=device
+    )
+
+    dual_verts = dual_verts[active]
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        quad_indices[i:end] = vert_map[quad_indices[i:end]]
+
+    mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
+
+    # -------------------------------------------------------------------------
+    # 7. 🔥 QUAD-LEVEL INNER / OUTER FILTERING (ULTIMATE FIX)
+    # -------------------------------------------------------------------------
+    if remove_inner_faces:
+        print(f"Removing Inner Layer for {quad_indices.shape[0]} quads ...")
+        quad_centers = torch.empty(
+            (quad_indices.shape[0], 3),
+            dtype=torch.float32,
+            device=device
+        )
+
+        for i in range(0, quad_indices.shape[0], chunk_size):
+            end = min(i + chunk_size, quad_indices.shape[0])
+            q = quad_indices[i:end].long()
+            quad_centers[i:end] = (
+                mesh_vertices[q[:, 0]] +
+                mesh_vertices[q[:, 1]] +
+                mesh_vertices[q[:, 2]] +
+                mesh_vertices[q[:, 3]]
+            ) * 0.25
+
+        sdf = chunked_sdf_raystab(bvh, quad_centers)
+        is_outer = sdf >= -eps * 0.1
+
+        quad_indices = quad_indices[is_outer]
+        intersected_dir = intersected_dir[is_outer]
+        
+    # Re-index vertices to remove unused ones
+    print('Re-indexing vertices after quad filtering ...')
+    used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
+    used_verts[quad_indices.flatten()] = True
+
+    new_vert_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
+    new_vert_idx[used_verts] = torch.arange(used_verts.sum(), dtype=torch.int32, device=device)
+    mesh_vertices = mesh_vertices[used_verts]
+
+    # Remap quad indices
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        quad_indices[i:end] = new_vert_idx[quad_indices[i:end]]        
+
+    # -------------------------------------------------------------------------
+    # 8. Triangulation (ONLY outer quads)
+    # -------------------------------------------------------------------------
+    print('Triangulation ...')
+    mesh_triangles = torch.empty(
+        (quad_indices.shape[0] * 2, 3),
+        dtype=torch.int32,
+        device=device
+    )
+
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        q = quad_indices[i:end]
+        d = intersected_dir[i:end].unsqueeze(1)
+
+        t1 = torch.where(d == 1, q[:, s1_p], q[:, s1_n])
+        t2 = torch.where(d == 1, q[:, s2_p], q[:, s2_n])
+
+        n1a = torch.linalg.cross(
+            mesh_vertices[t1[:, 1]] - mesh_vertices[t1[:, 0]],
+            mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 0]]
+        )
+        n1b = torch.linalg.cross(
+            mesh_vertices[t1[:, 4]] - mesh_vertices[t1[:, 3]],
+            mesh_vertices[t1[:, 5]] - mesh_vertices[t1[:, 3]]
+        )
+        a1 = (n1a * n1b).sum(dim=1).abs()
+
+        n2a = torch.linalg.cross(
+            mesh_vertices[t2[:, 1]] - mesh_vertices[t2[:, 0]],
+            mesh_vertices[t2[:, 2]] - mesh_vertices[t2[:, 0]]
+        )
+        n2b = torch.linalg.cross(
+            mesh_vertices[t2[:, 4]] - mesh_vertices[t2[:, 3]],
+            mesh_vertices[t2[:, 5]] - mesh_vertices[t2[:, 3]]
+        )
+        a2 = (n2a * n2b).sum(dim=1).abs()
+
+        mesh_triangles[i*2:end*2] = torch.where(
+            (a1 < a2).unsqueeze(1),
+            t1,
+            t2
+        ).reshape(-1, 3)
+
+    return mesh_vertices, mesh_triangles
+    
+def reconstruct_mesh_dc_quad(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    resolution: int = 256,
+    band: float = 1,
+    verbose: bool = False,
+    bvh=None,
+    remove_inner_faces: bool = False
+):
+    device = vertices.device
+    chunk_size = 524_288
+
+    # -------------------------------------------------------------------------
+    # 1. Bounding box & scale
+    # -------------------------------------------------------------------------
+    bbox_min = vertices.min(dim=0).values
+    bbox_max = vertices.max(dim=0).values
+    center = (bbox_min + bbox_max) * 0.5
+    scale = (bbox_max - bbox_min).max().item() * 1.1
+
+    # -------------------------------------------------------------------------
+    # 2. Constants
+    # -------------------------------------------------------------------------
+    edge_neighbor_voxel_offset = torch.tensor([
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+    ], dtype=torch.int32, device=device).unsqueeze(0)
+
+    s1_n = torch.tensor([0, 1, 2, 0, 2, 3], device=device)
+    s1_p = torch.tensor([0, 2, 1, 0, 3, 2], device=device)
+    s2_n = torch.tensor([0, 1, 3, 3, 1, 2], device=device)
+    s2_p = torch.tensor([0, 3, 1, 3, 2, 1], device=device)
+
+    OFFSETS = torch.tensor(
+        [[0,0,0],[1,0,0],[0,1,0],[1,1,0],
+         [0,0,1],[1,0,1],[0,1,1],[1,1,1]],
+        dtype=torch.int32,
+        device=device
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Helpers
+    # -------------------------------------------------------------------------
+    def chunked_udf(bvh_ptr, pts):
+        N = pts.shape[0]
+        dist = torch.empty(N, dtype=torch.float32, device=device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d, _, _ = bvh_ptr.unsigned_distance(pts[i:end])
+            dist[i:end] = d
+        return dist
+
+    def chunked_sdf_raystab(bvh_ptr, pts):
+        N = pts.shape[0]
+        dist = torch.empty(N, dtype=torch.float32, device=device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d, _, _ = bvh_ptr.signed_distance(pts[i:end], mode="raystab")
+            dist[i:end] = d
+        return dist
+
+    # -------------------------------------------------------------------------
+    # 4. Sparse grid construction
+    # -------------------------------------------------------------------------
+    if bvh is None:
+        bvh = cuBVH(vertices.detach().clone(), faces.detach().clone())
+
+    eps = max(band * scale / resolution, scale / resolution * 0.5)
+
+    base_res = resolution
+    while base_res > 32:
+        base_res //= 2
+
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(base_res, device=device),
+            torch.arange(base_res, device=device),
+            torch.arange(base_res, device=device),
+            indexing="ij"
+        ),
+        dim=-1
+    ).int().reshape(-1, 3)
+
+    pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_res)).item()) + 1, desc="Sparse Grid", disable=not verbose)
+    while True:
+        pbar.update(1)
+        cell = scale / base_res
+        pts = ((coords.float() + 0.5) / base_res - 0.5) * scale + center
+        dist = chunked_udf(bvh, pts)
+        coords = coords[torch.abs(dist - eps) < 0.87 * cell + eps * 0.5]
+
+        if base_res >= resolution:
+            break
+
+        base_res *= 2
+        coords = (coords.unsqueeze(1) * 2 + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+        coords = torch.unique(coords, dim=0)
+    pbar.close()
+    
+    # -------------------------------------------------------------------------
+    # 5. Dual contouring
+    # -------------------------------------------------------------------------
+    print('Dual Contouring ...')
+    Nvox = coords.shape[0]
+
+    hashmap_vox = _init_hashmap(resolution, 2 * Nvox, device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap_vox,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1),
+        resolution, resolution, resolution
+    )
+
+    grid_verts = _C.get_sparse_voxel_grid_active_vertices(
+        *hashmap_vox, coords.contiguous(),
+        resolution, resolution, resolution
+    )
+
+    pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
+    dist_vert = chunked_udf(bvh, pts_vert)
+
+    hashmap_vert = _init_hashmap(resolution + 1, 2 * grid_verts.shape[0], device)
+    _C.hashmap_insert_3d_idx_as_val_cuda(
+        *hashmap_vert,
+        torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1),
+        resolution + 1, resolution + 1, resolution + 1
+    )
+
+    dual_verts, intersected = _C.simple_dual_contour(
+        *hashmap_vert,
+        coords,
+        dist_vert - eps,
+        resolution + 1, resolution + 1, resolution + 1
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. Topology (quads)
+    # -------------------------------------------------------------------------
+    print('Quad Topology ...')
+    quad_list, dir_list = [], []
+    nz = torch.nonzero(intersected)
+
+    for i in range(0, nz.shape[0], chunk_size):
+        c = nz[i:i + chunk_size]
+        v_idx, a_idx = c[:, 0], c[:, 1]
+        neigh = coords[v_idx].unsqueeze(1) + edge_neighbor_voxel_offset[0, a_idx]
+        keys = torch.cat(
+            [torch.zeros((neigh.shape[0] * 4, 1), dtype=torch.int32, device=device),
+             neigh.reshape(-1, 3)],
+            dim=1
+        )
+        lookup = _C.hashmap_lookup_3d_cuda(
+            *hashmap_vox, keys,
+            resolution, resolution, resolution
+        ).reshape(-1, 4).int()
+
+        mask = (lookup != 0xffffffff).all(dim=1)
+        if mask.any():
+            quad_list.append(lookup[mask])
+            dir_list.append(intersected[v_idx[mask], a_idx[mask]])
+
+    if not quad_list:
+        return (
+            torch.zeros((0, 3), device=device),
+            torch.zeros((0, 3), device=device, dtype=torch.int32)
+        )
+
+    quad_indices = torch.cat(quad_list, dim=0)
+    intersected_dir = torch.cat(dir_list, dim=0).int()
+
+    # -------------------------------------------------------------------------
+    # 7. Re-index vertices
+    # -------------------------------------------------------------------------
+    print('Re-indexing vertices ...')
+    active = torch.zeros(Nvox, dtype=torch.bool, device=device)
+    active[quad_indices.flatten()] = True
+
+    vert_map = torch.full((Nvox,), -1, dtype=torch.int32, device=device)
+    vert_map[active] = torch.arange(
+        active.sum(),
+        dtype=torch.int32,
+        device=device
+    )
+
+    dual_verts = dual_verts[active]
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        quad_indices[i:end] = vert_map[quad_indices[i:end]]
+
+    mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
+
+    # -------------------------------------------------------------------------
+    # 8. 🔥 QUAD-LEVEL INNER / OUTER FILTERING
+    # -------------------------------------------------------------------------
+    if remove_inner_faces:
+        print(f"Removing Inner Layer for {quad_indices.shape[0]} quads ...")        
+        quad_centers = torch.empty(
+            (quad_indices.shape[0], 3),
+            dtype=torch.float32,
+            device=device
+        )
+
+        for i in range(0, quad_indices.shape[0], chunk_size):
+            end = min(i + chunk_size, quad_indices.shape[0])
+            q = quad_indices[i:end].long()
+            quad_centers[i:end] = (
+                mesh_vertices[q[:, 0]] +
+                mesh_vertices[q[:, 1]] +
+                mesh_vertices[q[:, 2]] +
+                mesh_vertices[q[:, 3]]
+            ) * 0.25
+
+        sdf = chunked_sdf_raystab(bvh, quad_centers)
+        is_outer = sdf >= -eps * 0.1
+
+        quad_indices = quad_indices[is_outer]
+        intersected_dir = intersected_dir[is_outer]
+        
+    # Re-index vertices to remove unused ones
+    print('Re-indexing vertices after quad filtering ...')
+    used_verts = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
+    used_verts[quad_indices.flatten()] = True
+
+    new_vert_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
+    new_vert_idx[used_verts] = torch.arange(used_verts.sum(), dtype=torch.int32, device=device)
+    mesh_vertices = mesh_vertices[used_verts]
+
+    # Remap quad indices
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        quad_indices[i:end] = new_vert_idx[quad_indices[i:end]]          
+
+    # -------------------------------------------------------------------------
+    # 9. Triangulation (outer quads only)
+    # -------------------------------------------------------------------------
+    print('Triangulation ...')
+    mesh_triangles = torch.empty(
+        (quad_indices.shape[0] * 2, 3),
+        dtype=torch.int32,
+        device=device
+    )
+
+    for i in range(0, quad_indices.shape[0], chunk_size):
+        end = min(i + chunk_size, quad_indices.shape[0])
+        q = quad_indices[i:end]
+        d = intersected_dir[i:end].unsqueeze(1)
+
+        t1 = torch.where(d == 1, q[:, s1_p], q[:, s1_n])
+        t2 = torch.where(d == 1, q[:, s2_p], q[:, s2_n])
+
+        n1a = torch.linalg.cross(
+            mesh_vertices[t1[:, 1]] - mesh_vertices[t1[:, 0]],
+            mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 0]]
+        )
+        n1b = torch.linalg.cross(
+            mesh_vertices[t1[:, 4]] - mesh_vertices[t1[:, 3]],
+            mesh_vertices[t1[:, 5]] - mesh_vertices[t1[:, 3]]
+        )
+        a1 = (n1a * n1b).sum(dim=1).abs()
+
+        n2a = torch.linalg.cross(
+            mesh_vertices[t2[:, 1]] - mesh_vertices[t2[:, 0]],
+            mesh_vertices[t2[:, 2]] - mesh_vertices[t2[:, 0]]
+        )
+        n2b = torch.linalg.cross(
+            mesh_vertices[t2[:, 4]] - mesh_vertices[t2[:, 3]],
+            mesh_vertices[t2[:, 5]] - mesh_vertices[t2[:, 3]]
+        )
+        a2 = (n2a * n2b).sum(dim=1).abs()
+
+        mesh_triangles[i*2:end*2] = torch.where(
+            (a1 < a2).unsqueeze(1),
+            t1,
+            t2
+        ).reshape(-1, 3)
+
+    return mesh_vertices, mesh_triangles    
