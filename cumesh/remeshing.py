@@ -3,7 +3,27 @@ import torch
 from tqdm import tqdm
 from . import _C
 from .bvh import cuBVH
+from concurrent.futures import ThreadPoolExecutor
 
+def filter_chunk(tris, mask):
+    return tris[mask]
+
+def threaded_filter_triangles(triangles, mask, chunk_size=1_000_000, num_threads=8):
+    n = triangles.shape[0]
+    futures = []
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        for i in range(0, n, chunk_size):
+            end = min(i + chunk_size, n)
+            futures.append(
+                executor.submit(
+                    filter_chunk,
+                    triangles[i:end],
+                    mask[i:end]
+                )
+            )
+
+    return torch.cat([f.result() for f in futures], dim=0)
 
 def _init_hashmap(resolution, capacity, device):
     VOL = resolution * resolution * resolution
@@ -290,14 +310,27 @@ def reconstruct_mesh_dc(
     # or very close to surface (within eps tolerance)
     is_outer = signed_dist >= -eps * 0.1
     
-    print(f"Filtering {mesh_triangles.shape[0]} triangles...")
+    print('Start filtering triangles')
     # Use integer indexing instead of boolean indexing - much faster for large tensors
     # torch.nonzero finds the indices where is_outer is True, then we use integer indexing
+    print('Moving triangles to cpu ...')
     mesh_triangles_cpu = mesh_triangles.cpu()
     is_outer_cpu = is_outer.cpu()
 
-    mesh_triangles_cpu = mesh_triangles_cpu[is_outer_cpu]
+    print(f"Filtering {mesh_triangles_cpu.shape[0]} triangles (threaded)...")
+    mesh_triangles_cpu = threaded_filter_triangles(
+        mesh_triangles_cpu,
+        is_outer_cpu,
+        chunk_size=1_000_000,
+        num_threads=8  # tune this
+    )
+    
+    print('Moving triangles to gpu ...')
     mesh_triangles = mesh_triangles_cpu.to(device)
+    
+    del is_outer_cpu
+    del mesh_triangles_cpu        
+    print('Filtering done')
     #if verbose:
     #    pbar_layer.update(1)  # Filtering done
     #    pbar_layer.close()
@@ -581,15 +614,27 @@ def remesh_narrow_band_dc(
         # or very close to surface (within eps tolerance)
         is_outer = signed_dist >= -eps * 0.1
         
-        print(f"Filtering {mesh_triangles.shape[0]} triangles...")
+        print('Start filtering triangles')
         # Use integer indexing instead of boolean indexing - much faster for large tensors
         # torch.nonzero finds the indices where is_outer is True, then we use integer indexing
+        print('Moving triangles to cpu ...')
         mesh_triangles_cpu = mesh_triangles.cpu()
         is_outer_cpu = is_outer.cpu()
 
-        mesh_triangles_cpu = mesh_triangles_cpu[is_outer_cpu]
+        print(f"Filtering {mesh_triangles_cpu.shape[0]} triangles (threaded)...")
+        mesh_triangles_cpu = threaded_filter_triangles(
+            mesh_triangles_cpu,
+            is_outer_cpu,
+            chunk_size=1_000_000,
+            num_threads=8  # tune this
+        )
+        
+        print('Moving triangles to gpu ...')
         mesh_triangles = mesh_triangles_cpu.to(device)
         
+        del is_outer_cpu
+        del mesh_triangles_cpu        
+        print('Filtering done')
         #if verbose:
         #    pbar_layer.update(1)  # Filtering done
         #    pbar_layer.close()
